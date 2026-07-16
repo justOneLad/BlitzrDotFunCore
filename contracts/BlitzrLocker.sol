@@ -60,8 +60,8 @@ contract BlitzrLocker {
     error InvalidBps();
     error WrongFee();
 
-    uint256 public creatorBps  = 7_000; // 70 %
-    uint256 public platformBps = 3_000; // 30 %
+    uint256 public creatorBps  = 8_500; // 85 %
+    uint256 public platformBps = 1_500; // 15 %
     uint256 private constant BPS = 10_000;
 
     uint256 public ctoFee = 0.05 ether; // anti-spam charge for applyForCTO, owner-adjustable
@@ -71,9 +71,7 @@ contract BlitzrLocker {
     // key to, which BlitzrToken has no special-case rejection for.
     address private constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
-    // Inverted so the zero value (every mapping's default) means "burn enabled" — burn is on by
-    // default for every token without needing an explicit write at registration time.
-    mapping(address => bool) private _burnDisabled;
+    mapping(address => bool) private _burnEnabled; // off by default for every token
 
     struct Position {
         uint256 tokenId;
@@ -221,7 +219,7 @@ contract BlitzrLocker {
     }
 
     function burnEnabled(address token) public view returns (bool) {
-        return !_burnDisabled[token];
+        return _burnEnabled[token];
     }
 
     // Callable by either the token's own feeWallet (their project, their tokenomics) or the
@@ -231,7 +229,7 @@ contract BlitzrLocker {
         Position storage pos = positions[token];
         if (pos.tokenId == 0) revert UnknownToken();
         if (msg.sender != pos.feeWallet && msg.sender != owner) revert NotAuthorized();
-        _burnDisabled[token] = !enabled;
+        _burnEnabled[token] = enabled;
         emit BurnToggled(token, enabled);
     }
 

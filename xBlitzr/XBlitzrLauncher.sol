@@ -66,6 +66,7 @@ interface IUnlockCallback {
 interface IXBlitzrHook {
     function registerPosition(address token, PoolKey calldata key, address feeWallet) external;
     function positions(address token) external view returns (address feeWallet, Currency currency0, Currency currency1);
+    function platformWallet() external view returns (address);
 }
 
 interface IBlitzrToken {
@@ -209,6 +210,7 @@ contract XBlitzrLauncher is IUnlockCallback {
     error InvalidTickRange();
     error UnknownToken();
     error InsufficientOutput();
+    error InvalidBps();
 
     uint256 public constant TOTAL_SUPPLY = 1_000_000_000e18;
 
@@ -217,15 +219,14 @@ contract XBlitzrLauncher is IUnlockCallback {
     int24 private constant MAX_TICK     =  887_200;
 
     // Uniswap fee units are hundredths of a bip (1e-6) — 10_000 = 1 %. This is the pool's own
-    // LP fee, separate from XBlitzrHook's HOOK_FEE_BPS. It accrues to the locked position and
-    // is realized via collectPoolFees() below: the quote-currency leg pays the creator, the
-    // token-currency leg is burned — every launched token is deflationary via its own fees.
+    // LP fee, separate from XBlitzrHook's hookFeeBps. It accrues to the locked position and is
+    // realized via collectPoolFees() below: both the quote-currency and token-currency legs are
+    // split between creator and platform per creatorBps/platformBps (owner-adjustable).
     uint24 private constant POOL_FEE = 10_000;
 
-    // Not address(0): BlitzrToken._transfer reverts on transfers to the zero address, so the
-    // conventional dead address is used instead — a normal, code-less address nobody holds the
-    // key to, which BlitzrToken has no special-case rejection for.
-    address private constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+    uint256 public creatorBps  = 8_500; // 85 %, owner-adjustable via setFeeBps
+    uint256 public platformBps = 1_500; // 15 %, owner-adjustable via setFeeBps
+    uint256 private constant BPS = 10_000;
 
     struct QuoteToken {
         uint256 marketCapRef;
@@ -286,7 +287,16 @@ contract XBlitzrLauncher is IUnlockCallback {
     event ETHRescued(address indexed to, uint256 amount);
     event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-    event PoolFeesCollected(address indexed token, address indexed creator, uint256 quotePaid, uint256 tokenBurned);
+    event PoolFeesCollected(
+        address indexed token,
+        address indexed creator,
+        address indexed platform,
+        uint256 quoteToCreator,
+        uint256 quoteToPlatform,
+        uint256 tokenToCreator,
+        uint256 tokenToPlatform
+    );
+    event FeeBpsSet(uint256 creatorBps, uint256 platformBps);
 
     modifier onlyOwner() { if (msg.sender != owner) revert NotOwner(); _; }
 
@@ -341,6 +351,13 @@ contract XBlitzrLauncher is IUnlockCallback {
     function setAntiBotBlocks(uint256 blocks_) external onlyOwner {
         antiBotBlocks = blocks_;
         emit AntiBotBlocksSet(blocks_);
+    }
+
+    function setFeeBps(uint256 creator_, uint256 platform_) external onlyOwner {
+        if (creator_ + platform_ != BPS) revert InvalidBps();
+        creatorBps  = creator_;
+        platformBps = platform_;
+        emit FeeBpsSet(creator_, platform_);
     }
 
     // token_ == address(0) re-registers native ETH/BNB's marketCapRef — unlike V3, address(0)
@@ -441,15 +458,15 @@ contract XBlitzrLauncher is IUnlockCallback {
 
     // Realizes the pool's accrued 1 % LP fee via a zero-delta poke (see PoolFeePosition /
     // XBlitzrHook.beforeRemoveLiquidity for why only this contract can ever successfully call
-    // modifyLiquidity again on that position). The quote-currency leg pays the creator; the
-    // token-currency leg is burned, not paid out — every launched token is deflationary via its
-    // own trading fees. Permissionless — the split destination is fixed by the token/quote
-    // identity, not by the caller, so there's no way to misdirect funds by calling this early or
-    // often; it only ever determines *when* fees get realized.
-    function collectPoolFees(address token) external returns (uint256 quotePaid, uint256 tokenBurned) {
+    // modifyLiquidity again on that position). Both the quote-currency and token-currency legs
+    // are split between the creator's feeWallet and platformWallet per creatorBps/platformBps.
+    // Permissionless — the destination and split are fixed by the token/quote identity and the
+    // current bps, not by the caller, so there's no way to misdirect funds by calling this early
+    // or often; it only ever determines *when* fees get realized.
+    function collectPoolFees(address token) external returns (uint256 quotePaid, uint256 tokenAmount) {
         if (poolFeePositions[token].key.hooks == address(0)) revert UnknownToken();
         bytes memory result = poolManager.unlock(abi.encode(uint8(1), abi.encode(token)));
-        (quotePaid, tokenBurned) = abi.decode(result, (uint256, uint256));
+        (quotePaid, tokenAmount) = abi.decode(result, (uint256, uint256));
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
@@ -460,8 +477,8 @@ contract XBlitzrLauncher is IUnlockCallback {
             return abi.encode(_executeLaunch(d));
         } else {
             address token = abi.decode(payload, (address));
-            (uint256 quotePaid, uint256 tokenBurned) = _executePoke(token);
-            return abi.encode(quotePaid, tokenBurned);
+            (uint256 quotePaid, uint256 tokenAmount) = _executePoke(token);
+            return abi.encode(quotePaid, tokenAmount);
         }
     }
 
@@ -508,9 +525,7 @@ contract XBlitzrLauncher is IUnlockCallback {
 
         // Must happen before _settleOwed below: PoolManager is about to receive ~100% of supply
         // as locked liquidity, which would itself trip the anti-bot cap if not exempted first.
-        // BURN_ADDRESS is exempted too since its balance only ever grows.
         IBlitzrToken(d.token).setExempt(address(poolManager), true);
-        IBlitzrToken(d.token).setExempt(BURN_ADDRESS, true);
 
         _settleOwed(tokenCurrency, callerDelta, tokenIsCurrency0);
 
@@ -533,12 +548,13 @@ contract XBlitzrLauncher is IUnlockCallback {
     // allows this specific call shape (liquidityDelta == 0, sender == this contract) through
     // beforeRemoveLiquidity — any other caller or any nonzero delta reverts there.
     //
-    // The two accrued legs are NOT both creator revenue: currency0/currency1 just reflects
-    // address sort order, which varies per launch, so which leg is "the token" vs "the quote"
-    // has to be resolved against the actual token address, not assumed from position. The quote
-    // leg pays the creator; the token leg is sent to BURN_ADDRESS — every launched token is
-    // deflationary via its own accrued trading fees.
-    function _executePoke(address token) private returns (uint256 quotePaid, uint256 tokenBurned) {
+    // currency0/currency1 just reflects address sort order, which varies per launch, so which
+    // leg is "the token" vs "the quote" has to be resolved against the actual token address,
+    // not assumed from position. Both legs are split creatorBps/platformBps between the
+    // creator's feeWallet and platformWallet — platform's share absorbs rounding dust (computed
+    // as the remainder after creator's share, not its own bps multiply, to avoid a second
+    // independent rounding loss).
+    function _executePoke(address token) private returns (uint256 quotePaid, uint256 tokenAmount) {
         PoolFeePosition storage pos = poolFeePositions[token];
 
         (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(
@@ -553,6 +569,7 @@ contract XBlitzrLauncher is IUnlockCallback {
         );
 
         (address feeWallet,,) = IXBlitzrHook(hook).positions(token);
+        address platform = IXBlitzrHook(hook).platformWallet();
 
         bool tokenIsCurrency0 = Currency.unwrap(pos.key.currency0) == token;
         (Currency tokenCurrency, Currency quoteCurrency) = tokenIsCurrency0
@@ -562,16 +579,25 @@ contract XBlitzrLauncher is IUnlockCallback {
             ? (callerDelta.amount0(), callerDelta.amount1())
             : (callerDelta.amount1(), callerDelta.amount0());
 
+        uint256 quoteToCreator; uint256 quoteToPlatform;
+        uint256 tokenToCreator; uint256 tokenToPlatform;
+
         if (quoteAmt > 0) {
             quotePaid = uint256(uint128(quoteAmt));
-            poolManager.take(quoteCurrency, feeWallet, quotePaid);
+            quoteToCreator  = quotePaid * creatorBps / BPS;
+            quoteToPlatform = quotePaid - quoteToCreator;
+            if (quoteToCreator  > 0) poolManager.take(quoteCurrency, feeWallet, quoteToCreator);
+            if (quoteToPlatform > 0) poolManager.take(quoteCurrency, platform,  quoteToPlatform);
         }
         if (tokenAmt > 0) {
-            tokenBurned = uint256(uint128(tokenAmt));
-            poolManager.take(tokenCurrency, BURN_ADDRESS, tokenBurned);
+            tokenAmount = uint256(uint128(tokenAmt));
+            tokenToCreator  = tokenAmount * creatorBps / BPS;
+            tokenToPlatform = tokenAmount - tokenToCreator;
+            if (tokenToCreator  > 0) poolManager.take(tokenCurrency, feeWallet, tokenToCreator);
+            if (tokenToPlatform > 0) poolManager.take(tokenCurrency, platform,  tokenToPlatform);
         }
 
-        emit PoolFeesCollected(token, feeWallet, quotePaid, tokenBurned);
+        emit PoolFeesCollected(token, feeWallet, platform, quoteToCreator, quoteToPlatform, tokenToCreator, tokenToPlatform);
     }
 
     function _settleOwed(Currency tokenCurrency, BalanceDelta callerDelta, bool tokenIsCurrency0) private {

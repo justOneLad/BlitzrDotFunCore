@@ -2,12 +2,11 @@
 
 xBlitzr is the Uniswap V4 counterpart to the V3 Blitzr stack (`../contracts/`). Same job —
 launch a token, seed permanent one-sided liquidity, lock it forever — rebuilt on V4's singleton
-`PoolManager` + hooks architecture instead of per-pool V3 contracts. Unlike V3's single 70/25/5
-creator/platform/charity split, xBlitzr runs **two independent revenue streams, each paid
-entirely to one party**: a 1 % pool LP fee, split by *currency* rather than by recipient bps — the
-quote-currency portion pays the creator, the token-currency portion is burned, making every
-launched token deflationary via its own trading activity — and a separate 0.5 % hook fee paid
-entirely to the platform. No charity wallet in this variant.
+`PoolManager` + hooks architecture instead of per-pool V3 contracts. xBlitzr runs **two
+independent revenue streams**: a 1 % pool LP fee split `creatorBps`/`platformBps` (default
+85 % / 15 %, owner-adjustable, applied to both currency legs) and a separate `hookFeeBps` hook
+fee (default 0.3 %, owner-adjustable) paid entirely to the platform. No charity wallet in this
+variant.
 
 ---
 
@@ -37,24 +36,25 @@ share one gate. That gate distinguishes them by delta value, not by who's asking
   launcher** — the position's owner in `PoolManager`'s accounting, and the only address that
   could ever successfully make this call anyway (V4 positions are keyed by whoever called
   `modifyLiquidity` originally). `XBlitzrLauncher.collectPoolFees(token)` drives this: it replays
-  the poke against the position's stored `PoolKey`/tick range, then pays 100 % of whatever comes
-  back to the creator. Permissionless to call — funds always land at the registered `feeWallet`
-  regardless of who triggers it, so calling it early or often can't misdirect anything, only
-  affects *when* the creator gets paid.
+  the poke against the position's stored `PoolKey`/tick range, then splits whatever comes back
+  `creatorBps`/`platformBps` between the creator's `feeWallet` and `platformWallet`. Permissionless
+  to call — the split destination is fixed by the token/quote identity and the current bps, not
+  by the caller, so calling it early or often can't misdirect anything, only affects *when* fees
+  get realized.
 - `liquidityDelta != 0` (any real removal): reverts unconditionally, including for the launcher.
   This is what makes the lock permanent — not any restraint in the launcher's own code, this hook
   check.
 
-**The hook's own cut is separate and immediate** — `XBlitzrHook.afterSwap` skims `HOOK_FEE_BPS`
-(0.5 %) off every swap's unspecified-currency leg live, via the returned-delta mechanism, and
-pays it entirely to `platformWallet` via a direct `poolManager.take()` call. No claim step, no
+**The hook's own cut is separate and immediate** — `XBlitzrHook.afterSwap` skims `hookFeeBps`
+(default 0.3 %) off every swap's unspecified-currency leg live, via the returned-delta mechanism,
+and pays it entirely to `platformWallet` via a direct `poolManager.take()` call. No claim step, no
 pending balance — this one lands the instant a swap happens, same swap that also generates the
-pool-fee accrual the creator later collects via `collectPoolFees`.
+pool-fee accrual the creator/platform later collect via `collectPoolFees`.
 
 So a single swap generates revenue for *both* streams simultaneously: the pool's native 1 % LP
-fee accrues silently until someone pokes it (creator's share, claimed), and the hook's separate
-0.5 % skim pays out immediately (platform's share, live) — two different mechanisms, two
-different recipients, running side by side on every trade.
+fee accrues silently until someone pokes it (creator/platform split, claimed), and the hook's
+separate 0.3 % skim pays out immediately (platform-only, live) — two different mechanisms,
+running side by side on every trade.
 
 ---
 
@@ -82,13 +82,14 @@ XBlitzrLauncher
   └─ collectPoolFees(token)  [callable any time, by anyone, after launch]
         └─ poolManager.unlock(...)  →  unlockCallback:
               ├─ poolManager.modifyLiquidity(key, {liquidityDelta: 0, ...})   ← the poke
-              └─ take() whatever comes back, entirely to the creator's feeWallet
+              └─ take() whatever comes back, split creatorBps/platformBps between feeWallet
+                 and platformWallet (default 85/15)
 
 XBlitzrHook  (attached to every xBlitzr pool)
   ├─ beforeAddLiquidity    → only the launcher may ever call this, and only once
   ├─ beforeRemoveLiquidity → liquidityDelta == 0 allowed, but launcher-only (the poke above);
   │                          liquidityDelta != 0 always reverts, from anyone, forever
-  └─ afterSwap → skims 0.5 % of every swap, live, entirely to platformWallet
+  └─ afterSwap → skims hookFeeBps of every swap, live, entirely to platformWallet (default 0.3 %)
 ```
 
 ---
@@ -116,10 +117,10 @@ XBlitzrHook  (attached to every xBlitzr pool)
 
 ## What's simplified relative to a "real" launch (deliberately, to control scope)
 
-- **No dynamic fee, no bps split.** `HOOK_FEE_BPS` (0.5 %) and the pool's `POOL_FEE` (1 %) are
-  both fixed constants, not owner-adjustable, and not using V4's dynamic-fee flag. Unlike V3's
-  `BlitzrLocker` (an adjustable `creatorBps`/`platformBps`/`charityBps` split on one stream),
-  xBlitzr has no split logic at all — each of the two streams goes entirely to one fixed party.
+- **No dynamic fee.** The pool's `POOL_FEE` (1 %) is a fixed constant, not using V4's
+  dynamic-fee flag. `creatorBps`/`platformBps` (pool fee split) and `hookFeeBps` (hook fee rate)
+  are owner-adjustable, same pattern as V3's `BlitzrLocker.creatorBps`/`platformBps` — but there's
+  no charity stream here.
 
 ---
 
@@ -173,9 +174,10 @@ from without violating the swapper's requested exact amount:
 
 `unspecifiedIsCurrency0 = !(zeroForOne == (amountSpecified < 0))`.
 
-The cut is computed as `HOOK_FEE_BPS` of the unspecified leg's realized delta magnitude, taken via
-a single direct `poolManager.take(feeCurrency, platformWallet, cut)` call, and the cut is returned
-from `afterSwap` as the hook's delta so `PoolManager`'s internal accounting for the swap stays
+The cut is computed as `hookFeeBps` (default 30 bps = 0.3 %, owner-adjustable via
+`setHookFeeBps`) of the unspecified leg's realized delta magnitude, taken via a single direct
+`poolManager.take(feeCurrency, platformWallet, cut)` call, and the cut is returned from
+`afterSwap` as the hook's delta so `PoolManager`'s internal accounting for the swap stays
 balanced. This sign convention and the settlement ordering (the `take()` call creates a debt on
 the hook's own currency ledger; `PoolManager` credits that ledger with the returned delta
 immediately after `afterSwap` returns, netting it to zero before `unlock()` finishes — see
@@ -185,6 +187,7 @@ hook's own `take()`.
 
 Note the creator's own instant-buy swap also pays this cut — every swap through the pool pays it
 uniformly, launch-time or not, and it always goes entirely to `platformWallet`, never the creator.
+This stream has no creator share at all, unlike the pool fee below.
 
 ---
 
@@ -203,20 +206,21 @@ one-sided *fee accrual*, since fees are taken on whichever currency was the inpu
 individual swap, regardless of the position's range: buys accrue fees in the quote currency,
 sells accrue fees in the token currency.
 
-**The two legs go to different places, not the same recipient.** `_executePoke` resolves which of
-`currency0`/`currency1` is actually the launched token (comparing against the `token` address
-directly — address sort order varies per launch, so this can't be assumed from position) and
-splits accordingly:
-- The quote-currency leg is paid to the creator's registered `feeWallet` (looked up live via
-  `IXBlitzrHook.positions(token)`, so a CTO reassignment via `ctoFeeWallet` immediately redirects
-  future collections too).
-- The token-currency leg is sent to `BURN_ADDRESS` (the conventional `0x...dEaD` address, not
-  `address(0)` — `BlitzrToken._transfer` explicitly reverts on transfers to the zero address, so
-  the dead address is used instead, same pattern many ERC-20s without a native `burn()` use).
+`_executePoke` resolves which of `currency0`/`currency1` is actually the launched token
+(comparing against the `token` address directly — address sort order varies per launch, so this
+can't be assumed from position), then splits **both** legs the same way:
+- The creator's share (`creatorBps`, default 8 500 = 85 %) is paid to the creator's registered
+  `feeWallet` (looked up live via `IXBlitzrHook.positions(token)`, so a CTO reassignment via
+  `ctoFeeWallet` immediately redirects future collections too).
+- The platform's share (`platformBps`, default 1 500 = 15 %) is paid to `platformWallet` (looked
+  up live via `IXBlitzrHook.platformWallet()`), computed as the remainder after the creator's
+  share rather than its own bps multiply, so rounding dust always lands with the platform instead
+  of being lost twice.
 
-Every launched token is therefore deflationary via its own trading activity: any time someone
-sells into the pool, 1% of that sale is permanently removed from circulation on the next
-`collectPoolFees` call, on top of whatever the creator is earning from the buy side.
+`creatorBps`/`platformBps` are owner-adjustable via `XBlitzrLauncher.setFeeBps(creator, platform)`
+and must sum to exactly 10 000. Each `collectPoolFees` call emits the exact per-leg,
+per-recipient amounts actually paid (`PoolFeesCollected`), so historical splits stay correct even
+across a later bps change.
 
 ---
 
@@ -259,13 +263,10 @@ runs, the actual `take()` to the real recipient hasn't happened yet — it happe
 launcher's own `unlockCallback`/`_instantBuy`, so the hook can't reliably know who'll end up
 holding the tokens. The token-level check is the one point that's guaranteed correct.
 
-`XBlitzrLauncher` exempts two addresses from the cap before renouncing token ownership, in
-`_executeLaunch`, before `_settleOwed` (which is what actually credits `PoolManager` with ~100%
-of supply — exemption must happen *before* that transfer, not after, or the transfer itself
-would trip the cap):
-- `address(poolManager)` — holds ~100% of supply as locked liquidity across every pool.
-- `BURN_ADDRESS` — accumulates every `collectPoolFees` burn indefinitely; without exemption it
-  would eventually exceed the cap and brick further burns for the rest of the anti-bot window.
+`XBlitzrLauncher` exempts `address(poolManager)` from the cap before renouncing token ownership,
+in `_executeLaunch`, before `_settleOwed` (which is what actually credits `PoolManager` with
+~100% of supply as locked liquidity across every pool — exemption must happen *before* that
+transfer, not after, or the transfer itself would trip the cap).
 
 `antiBotBlocks` (default 10) is owner-adjustable via `XBlitzrLauncher.setAntiBotBlocks`, passed
 to `initBlitzr` on every launch. As with V3, there's no creator carve-out — an instant buy larger

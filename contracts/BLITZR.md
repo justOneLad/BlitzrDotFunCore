@@ -38,9 +38,10 @@ BlitzrLauncher
   └─ transfer(remaining mint-rounding dust → creator)
 
 BlitzrLocker  (holds LP NFTs forever)
-  └─ claimFees(token)  →  the launched-token leg: burned by default (BURN_ADDRESS), or if
-                          burn is disabled for that token, split 70% feeWallet + 30% platformWallet
-                        →  the quote-token leg: always split 70% feeWallet + 30% platformWallet
+  └─ claimFees(token)  →  the launched-token leg: split 85% feeWallet + 15% platformWallet by
+                          default, or if burn is enabled for that token, sent entirely to
+                          BURN_ADDRESS instead
+                        →  the quote-token leg: always split 85% feeWallet + 15% platformWallet
 ```
 
 The quote token is purely the pool's pairing partner — the creator never sends or approves
@@ -151,25 +152,25 @@ Default values — updatable by the locker owner via `setFeeBps(creator, platfor
 
 | Recipient | Default share | Interaction |
 |-----------|--------------|-------------|
-| Creator fee wallet | 70 % (7 000 bps) | Initiates `claimFees` |
-| Platform wallet | 30 % (3 000 bps) | Passive recipient |
+| Creator fee wallet | 85 % (8 500 bps) | Initiates `claimFees` |
+| Platform wallet | 15 % (1 500 bps) | Passive recipient |
 
 Fees are distributed atomically. Platform receives the remainder after creator to absorb rounding dust.
 
 This split applies to whichever leg *isn't* being burned — see below.
 
-### Per-token burn (default on)
+### Per-token burn (default off)
 
 Each launch's V3 pool pairs two tokens: the launched token itself, and the quote token. On
 every `claimFees(token)`, `BlitzrLocker` determines which of `token0`/`token1` is actually the
 launched token (comparing against the `token` argument itself, not a fixed position, since V3
 address-sort ordering varies per launch) and treats its leg differently from the quote leg:
 
-- **The launched-token leg**: if burn is enabled for that token (the default), the *entire*
-  amount is sent to `BURN_ADDRESS` (the conventional `0x...dEaD` address — `BlitzrToken._transfer`
-  reverts on transfers to the zero address, so the dead address is used instead) — not split with
-  creator/platform first. If burn is disabled, this leg follows the normal creator/platform split
-  like any other.
+- **The launched-token leg**: if burn is enabled for that token, the *entire* amount is sent to
+  `BURN_ADDRESS` (the conventional `0x...dEaD` address — `BlitzrToken._transfer` reverts on
+  transfers to the zero address, so the dead address is used instead) — not split with
+  creator/platform first. Off by default, in which case this leg follows the normal
+  creator/platform split like any other.
 - **The quote-token leg**: never burned — always follows the normal creator/platform split,
   regardless of the token's burn setting.
 
@@ -249,7 +250,7 @@ ownership at the end of `launch()` — the exemption list is effectively frozen 
 
 ```solidity
 constructor(
-    address platformWallet_  // Receives 30 % of claimed swap fees (default)
+    address platformWallet_  // Receives 15 % of claimed swap fees (default)
 )
 ```
 
@@ -321,7 +322,7 @@ constructor(
 | Function | Description |
 |----------|-------------|
 | `claimFees(token)` | Collect and distribute fees for one token |
-| `setBurnEnabled(token, enabled)` | Toggle whether this token's launched-token fee leg is burned instead of paid out (default: on) |
+| `setBurnEnabled(token, enabled)` | Toggle whether this token's launched-token fee leg is burned instead of paid out (default: off) |
 
 ### BlitzrLocker (view)
 
