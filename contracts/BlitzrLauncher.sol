@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.32;
 
+// Blitzr — https://blitzr.fun
+
 interface IBlitzrToken {
     function initBlitzr(string calldata name_, string calldata symbol_, string calldata metaURI_, address launcher_, uint256 antiBotBlocks_) external;
     function renounceOwnership() external;

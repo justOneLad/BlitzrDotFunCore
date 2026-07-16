@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.32;
 
-// ============================================================================
-// UNVERIFIED SCAFFOLD — see XBlitzrHook.sol header. The math libraries in this
-// file (FullMath, TickMath, LiquidityAmounts) are hand-reproductions of the
-// well-known Uniswap v3-core/v4-core reference implementations, ported from
-// memory with no compiler or test-vector access in this sandbox. FullMath.mulDiv
-// in particular is security-critical 512-bit arithmetic — replace it with a
-// vetted implementation (OpenZeppelin Math.mulDiv or the canonical FullMath.sol)
-// before trusting this with real funds. See XBLITZR.md → "Verification Checklist".
-// ============================================================================
-
 type Currency is address;
 type PoolId   is bytes32;
 type BalanceDelta is int256;

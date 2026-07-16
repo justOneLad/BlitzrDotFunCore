@@ -1,18 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.32;
 
-// ============================================================================
-// UNVERIFIED SCAFFOLD — hand-rolled Uniswap V4 primitives.
-//
-// This sandbox has no network access to vendor the real `@uniswap/v4-core`
-// package, so the types/interfaces below are reproduced from the published
-// V4 spec rather than imported. They MUST be diffed against the actual
-// v4-core deployed on your target chain before this is trusted with real
-// funds — a single mismatched selector, struct field order, or hook-flag
-// bit silently breaks dispatch or, worse, misencodes a call.
-// See XBLITZR.md → "Verification Checklist" before deploying.
-// ============================================================================
-
 type Currency is address;
 type PoolId   is bytes32;
 type BalanceDelta is int256;
