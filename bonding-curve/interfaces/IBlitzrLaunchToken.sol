@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.32;
 
+// Blitzr — https://blitzr.fun
+
 /// @notice Minimal interface every launchpad token must implement so the factory
 ///         can manage the bonding-curve phase and trigger DEX migration.
 interface IBlitzrLaunchToken {
