@@ -276,7 +276,7 @@ constructor(
 1. Deploy `BlitzrToken` implementation (no constructor args)
 2. Deploy `BlitzrLocker(platformWallet)`
 3. Deploy `BlitzrLauncher(weth, tokenImpl, locker, launchFeeWallet, factory, positionMgr, router, launchFee)`
-4. Call `BlitzrLocker.setLauncher(blitzrLauncher)`
+4. Call `BlitzrLocker.setLauncher(blitzrLauncher, true)`
 5. Call `BlitzrLauncher.addDex(...)` for each additional DEX
 6. Call `BlitzrLauncher.addQuoteToken(...)` for USDC, WBTC, or other supported assets
 
@@ -310,7 +310,7 @@ constructor(
 
 | Function | Description |
 |----------|-------------|
-| `setLauncher(launcher)` | Set the address authorised to call `registerPosition` |
+| `setLauncher(launcher, enabled)` | Authorize or revoke a launcher contract's ability to call `registerPosition` — multiple launchers can be enabled at once |
 | `setPlatformWallet(wallet)` | Update platform fee recipient |
 | `setFeeBps(creator, platform)` | Update fee split; must sum to 10 000 |
 | `claimAllFees()` | Sweep all positions; skips failures |

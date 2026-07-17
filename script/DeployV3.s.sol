@@ -22,7 +22,7 @@ contract DeployV3 is Script {
         BlitzrLauncher launcherC = new BlitzrLauncher(
             weth, tokenImpl, address(lockerC), launchFeeWallet, factory, posMgr, router, launchFee
         );
-        lockerC.setLauncher(address(launcherC));
+        lockerC.setLauncher(address(launcherC), true);
         vm.stopBroadcast();
 
         locker = address(lockerC);

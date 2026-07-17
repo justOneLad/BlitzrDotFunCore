@@ -342,20 +342,22 @@ constructor(
 
 ## Deployment Order
 
-`BlitzrLocker` needs a `launcher` address and `BlitzrBondingCurve` needs a `locker` address —
-resolve the circular dependency by deploying the locker first with a temporary launcher, then
-wiring the real address after.
+`BlitzrLocker` needs at least one authorized launcher and `BlitzrBondingCurve` needs a `locker`
+address — resolve the circular dependency by deploying the locker first, then wiring the real
+address after.
 
-`BlitzrLocker.launcher` is a single address (`onlyLauncher` gates `registerPosition` to exactly
-one caller) — it **cannot** be shared between the V3 `BlitzrLauncher` and `BlitzrBondingCurve`
-at the same time; whichever one is set last via `setLauncher` is the only one that can register
-new positions. Deploy a **separate** `BlitzrLocker` instance for this stack rather than pointing
-it at the V3 stack's existing one.
+`BlitzrLocker.launchers` is an allowlist (`mapping(address => bool)`), not a single address, so
+the **same** `BlitzrLocker` instance can be shared across every launchpad stack at once — the V3
+`BlitzrLauncher`, `BlitzrBondingCurve`, and any Arc/future variant can all be authorized
+simultaneously via `setLauncher(addr, true)`. Reusing an already-deployed locker (e.g. the V3
+stack's existing one) is fine; deploying a fresh instance is only needed if you want this stack's
+fee split (`creatorBps`/`platformBps`), `platformWallet`, or `ctoFee` configured independently
+from another stack sharing the same locker.
 
 1. Deploy `BlitzrStandardToken` / `BlitzrTaxToken` implementations (clone targets; constructors set `_initialized = true`).
-2. Deploy `contracts/BlitzrLocker.sol(platformWallet_)` — a dedicated instance for this stack.
+2. Deploy `contracts/BlitzrLocker.sol(platformWallet_)`, or reuse an existing one.
 3. Deploy `BlitzrBondingCurve(...)` with the locker address from step 2.
-4. Call `locker.setLauncher(bondingCurve)` — until this runs, `registerPosition` reverts for every real migration.
+4. Call `locker.setLauncher(bondingCurve, true)` — until this runs, `registerPosition` reverts for every real migration.
 5. Call `bondingCurve.setReflectionTokenAllowed(token, true)` for every token creators should be able to select as a BlitzrTaxToken reflection target.
 
 ---

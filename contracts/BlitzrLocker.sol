@@ -89,7 +89,10 @@ contract BlitzrLocker {
     }
 
     address public owner;
-    address public launcher;
+    // Allowlist, not a single address — lets this one locker instance be shared across every
+    // launchpad stack/deployment (BlitzrLauncher, BlitzrBondingCurve, and any Arc/future variant)
+    // instead of requiring a dedicated BlitzrLocker per launcher.
+    mapping(address => bool) public launchers;
     address public platformWallet;
 
     mapping(address => Position) public positions; // launched token → locked position
@@ -113,7 +116,7 @@ contract BlitzrLocker {
     );
     event FeesBurned(address indexed token, uint256 amount0, uint256 amount1);
     event BurnToggled(address indexed token, bool enabled);
-    event LauncherSet(address indexed launcher);
+    event LauncherSet(address indexed launcher, bool enabled);
     event PlatformWalletSet(address indexed wallet);
     event FeeBpsUpdated(uint256 creatorBps, uint256 platformBps);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
@@ -122,7 +125,7 @@ contract BlitzrLocker {
     event CTOFeeSet(uint256 fee);
 
     modifier onlyOwner()    { if (msg.sender != owner)    revert NotOwner();    _; }
-    modifier onlyLauncher() { if (msg.sender != launcher) revert NotLauncher(); _; }
+    modifier onlyLauncher() { if (!launchers[msg.sender]) revert NotLauncher(); _; }
 
     constructor(address platformWallet_) {
         if (platformWallet_ == address(0)) revert ZeroAddress();
@@ -130,10 +133,13 @@ contract BlitzrLocker {
         platformWallet = platformWallet_;
     }
 
-    function setLauncher(address launcher_) external onlyOwner {
+    // Authorizes (or revokes) a launcher contract's ability to call registerPosition(). Multiple
+    // launchers can be enabled at once — e.g. BlitzrLauncher and BlitzrBondingCurve (and any
+    // Arc/future variant) sharing this same locker instance simultaneously.
+    function setLauncher(address launcher_, bool enabled_) external onlyOwner {
         if (launcher_ == address(0)) revert ZeroAddress();
-        launcher = launcher_;
-        emit LauncherSet(launcher_);
+        launchers[launcher_] = enabled_;
+        emit LauncherSet(launcher_, enabled_);
     }
 
     function setPlatformWallet(address wallet) external onlyOwner {
