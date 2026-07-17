@@ -386,3 +386,71 @@ bondingCurve.getTokensByCreator(creator)                // all tokens by one add
 | `minCurveBps` (default) | 3 000 (30%) | Minimum bonding-curve allocation |
 | `minLiquidityBps` (default) | 1 000 (10%) | Minimum DEX liquidity at migration |
 | `minSupply` / `maxSupply` (default) | 1e18 / 999 trillion × 1e18 | Per-launch `totalSupply` bounds |
+
+---
+
+## Arc Variant
+
+`BlitzrBondingCurveArc.sol` (`BlitzrBondingCurveArc`) and `tokens/BlitzrTaxTokenArc.sol`
+(`BlitzrTaxTokenArc`) are the same stack rebuilt for Arc, whose native gas token **is** USDC
+(6 decimals) rather than BNB, mirrored as an ERC20 at the fixed, network-wide address
+`0x3600000000000000000000000000000000000000` (`ARC_USDC`) — native balance and that ERC20's
+`balanceOf` are always in sync, so there is no WETH on Arc and no wrap/unwrap step is ever
+needed. `BlitzrStandardToken` is reused as-is (it was already DEX-agnostic); only the bonding
+curve and the tax token needed Arc-specific siblings. Every "BNB"-named field/error/function from
+the BSC contract was renamed to "USDC" in the Arc variant (`raisedBNB` → `raisedUSDC`,
+`rescueBNB` → `rescueUSDC`, etc.) — no BNB terminology survives in these two files.
+
+Differences from `BlitzrBondingCurve` / `BlitzrTaxToken`:
+
+- **No USD/native price oracle.** Since native already *is* USDC, the live USDC/WBNB spot-price
+  read (`usdQuotePair`, `setUsdQuotePair`, `_wbnbUsdReserves`) is gone entirely — there's no
+  `usdcToken_`/`usdQuotePair_` constructor param anymore. `_computeUSDCTargets` instead applies a
+  fixed decimal shift:
+
+  ```
+  virtualUSDC      = (startMarketCapUSD     × curveTokens) / totalSupply / 1e12
+  migrationTarget  = (migrationMarketCapUSD × liqTokens)   / totalSupply / 1e12
+  ```
+
+  `1e12` is exactly the 18-decimal-USD-input → 6-decimal-native-USDC conversion
+  (`USD_TO_NATIVE_SHIFT`) — a creator still passes `startMarketCapUSD`/`migrationMarketCapUSD` as
+  18-decimal USD figures (e.g. `5000e18` = $5,000), unchanged from the BSC contract's calling
+  convention; the curve just has to raise that many raw native-USDC units to hit
+  `migrationTarget`, no re-pricing after creation.
+- **No wrap step anywhere.** `_doMigrateV3` no longer calls `IWETH9LP.deposit{value: ...}` before
+  minting the V3 position — the raised value is already spendable `ARC_USDC` ERC20 balance the
+  moment it's received.
+- **Plain ERC20 router calls, not ETH-suffixed ones.** `_doMigrateV2` (the `BlitzrTaxTokenArc`
+  migration path) and `BlitzrTaxTokenArc._addLiquidity` use `addLiquidity(tokenA, tokenB, ...)`
+  instead of `addLiquidityETH`, approving both legs via `transferFrom` — Arc's router isn't
+  assumed to implement the ETH-suffixed sugar methods. Likewise, tax-proceeds swaps
+  (`_swapTokensForUSDC`, `_swapForReflectionToken`) always go through
+  `swapExactTokensForTokensSupportingFeeOnTransferTokens` with `ARC_USDC` passed explicitly,
+  never `swapExactTokensForETH...`.
+- **`rescueToken` blocks `ARC_USDC`.** Since native balance and `ARC_USDC`'s ERC20 balance are the
+  same underlying value, rescuing `ARC_USDC` through the generic token-rescue path would bypass
+  the `_totalRaisedUSDC` reserve check that `rescueUSDC` (renamed from `rescueBNB`) enforces —
+  `rescueToken(ARC_USDC, to)` reverts with `CannotRescueNativeUSDC()`; native/USDC rescue must go
+  through `rescueUSDC` instead.
+- **`getSpotPrice` decimal-adjusted.** Multiplies by `1e18 * USD_TO_NATIVE_SHIFT` instead of just
+  `1e18`, to keep the returned price normalized to the same 18-decimal-fixed-point "USD per
+  token" convention despite `poolUSDC` now being 6-decimal-scale internally.
+- **`setRouter` validates only `factory()`**, not a second `WETH()` check — there's no `WETH()`
+  to call on an Arc router.
+
+### Constructor Arguments (BlitzrBondingCurveArc)
+
+```solidity
+constructor(
+    address router_,             // Arc DEX router
+    address v3PositionManager_,  // Arc V3 NonfungiblePositionManager
+    address v3Factory_,          // Arc V3 Factory
+    address feeRecipient_,       // Platform fee destination
+    uint256 platformFee_,        // Bps on every buy/sell, ≤ 250 (2.5%)
+    address standardImpl_,       // Deployed BlitzrStandardToken implementation (shared, unchanged)
+    address taxImpl_,            // Deployed BlitzrTaxTokenArc implementation
+    address locker_,             // Deployed contracts/BlitzrLocker.sol
+    uint256 creationFee_         // Native USDC required to launch a token (may be 0)
+)
+```

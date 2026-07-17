@@ -416,3 +416,44 @@ pending         = liquidity × (feeGrowthInside − feeGrowthInsideLast) / 2¹²
 ```
 
 All arithmetic is `unchecked` (wrapping) per the Uniswap V3 spec.
+
+---
+
+## Arc Variant
+
+`BlitzrLauncherArc.sol` (`BlitzrLauncherArc`) is the same launcher rebuilt for Arc, whose native
+gas token **is** USDC (6 decimals) rather than ETH/BNB, mirrored as an ERC20 at the fixed,
+network-wide address `0x3600000000000000000000000000000000000000` — native balance and that
+ERC20's `balanceOf` are always in sync, so there is no WETH on Arc and no wrap/unwrap step is
+ever needed. Everything else — DEX registry, quote-token registration, one-sided tick math,
+anti-bot cap, locker registration — is unchanged.
+
+Differences from `BlitzrLauncher`:
+
+- **No `weth_` constructor param.** `USDC` is a hardcoded `constant`
+  (`0x3600000000000000000000000000000000000000`), not per-deployment config — it's fixed by the
+  network itself, so there's nothing to misconfigure at deploy time.
+- **No wrap step.** `_doInstantBuy` skips the `IWETH.deposit{value: extraUsdc}()` call entirely —
+  the native value this contract just received is already spendable as `USDC` ERC20 balance.
+- **`QuoteToken.wethPairFee` → `nativePairFee`** (and the matching `addQuoteToken` param), purely
+  a rename — same role, still the fee tier of an existing `USDC`/quoteToken pool used for the
+  multihop instant-buy path when `quoteToken != USDC`.
+- **`USDC` defaults to `marketCapRef = 5e6`** (~$5 at 6 decimals) in the constructor, versus
+  `5e18` (5 WETH) for the BSC contract's WETH default.
+- Launch fee, DEX registry, and quote-token mechanics are otherwise byte-for-byte identical —
+  `launchFee` is still a single global native-value figure, just denominated in 6-decimal USDC on
+  Arc instead of 18-decimal ETH/BNB (pass amounts accordingly when configuring it).
+
+### Constructor Arguments (BlitzrLauncherArc)
+
+```solidity
+constructor(
+    address tokenImpl_,          // BlitzrToken implementation (deployed separately)
+    address locker_,             // BlitzrLocker (set its launcher to this address after deploy)
+    address launchFeeWallet_,    // Platform wallet that receives per-launch fees (native USDC)
+    address initialFactory_,     // Factory of the first supported V3 DEX
+    address initialPositionMgr_, // Position manager of the first supported V3 DEX
+    address initialRouter_,      // Swap router of the first supported V3 DEX
+    uint256 launchFee_           // Global launch fee, in native USDC raw units (6 decimals)
+)
+```
