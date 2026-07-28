@@ -60,15 +60,13 @@ contract BlitzrLocker {
     error InvalidBps();
     error WrongFee();
 
-    uint256 public creatorBps  = 8_500; // 85 %
-    uint256 public platformBps = 1_500; // 15 %
+    uint256 public creatorBps  = 8_000; // 80 %
+    uint256 public platformBps = 2_000; // 20 %
     uint256 private constant BPS = 10_000;
 
     uint256 public ctoFee = 0.05 ether; // anti-spam charge for applyForCTO, owner-adjustable
 
-    // Not address(0): BlitzrToken._transfer reverts on transfers to the zero address, so the
-    // conventional dead address is used instead — a normal, code-less address nobody holds the
-    // key to, which BlitzrToken has no special-case rejection for.
+    // Not address(0): BlitzrToken._transfer reverts on transfers to the zero address.
     address private constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     mapping(address => bool) private _burnEnabled; // off by default for every token
@@ -89,9 +87,8 @@ contract BlitzrLocker {
     }
 
     address public owner;
-    // Allowlist, not a single address — lets this one locker instance be shared across every
-    // launchpad stack/deployment (BlitzrLauncher, BlitzrBondingCurve, and any Arc/future variant)
-    // instead of requiring a dedicated BlitzrLocker per launcher.
+    // Allowlist, not a single address — this one locker instance can be shared across multiple
+    // launcher deployments.
     mapping(address => bool) public launchers;
     address public platformWallet;
 
@@ -133,9 +130,6 @@ contract BlitzrLocker {
         platformWallet = platformWallet_;
     }
 
-    // Authorizes (or revokes) a launcher contract's ability to call registerPosition(). Multiple
-    // launchers can be enabled at once — e.g. BlitzrLauncher and BlitzrBondingCurve (and any
-    // Arc/future variant) sharing this same locker instance simultaneously.
     function setLauncher(address launcher_, bool enabled_) external onlyOwner {
         if (launcher_ == address(0)) revert ZeroAddress();
         launchers[launcher_] = enabled_;
@@ -161,8 +155,6 @@ contract BlitzrLocker {
         owner = newOwner;
     }
 
-    // Reassigns a token's creator fee wallet — a community takeover (CTO) lever for when the
-    // original creator is unreachable or has abandoned the project.
     function ctoFeeWallet(address token, address newFeeWallet) external onlyOwner {
         Position storage pos = positions[token];
         if (pos.tokenId == 0) revert UnknownToken();
@@ -177,11 +169,8 @@ contract BlitzrLocker {
         emit CTOFeeSet(fee_);
     }
 
-    // Public entry point for proposing a community takeover of an abandoned token's fee wallet.
-    // Gated by ctoFee (paid to platformWallet) so bots can't spam applications for free; the
+    // Gated by ctoFee (non-refundable, paid to platformWallet) so bots can't spam applications;
     // owner still reviews and executes via ctoFeeWallet — this only records the proposal.
-    // The fee is non-refundable: it's forwarded immediately and unconditionally, whether or
-    // not the owner ends up approving the application.
     function applyForCTO(address token, address proposedFeeWallet) external payable {
         Position storage pos = positions[token];
         if (pos.tokenId == 0) revert UnknownToken();
@@ -228,9 +217,7 @@ contract BlitzrLocker {
         return _burnEnabled[token];
     }
 
-    // Callable by either the token's own feeWallet (their project, their tokenomics) or the
-    // platform owner (same override authority ctoFeeWallet already has). Takes effect on the
-    // next claim; doesn't retroactively affect fees already distributed.
+    // Takes effect on the next claim; doesn't retroactively affect fees already distributed.
     function setBurnEnabled(address token, bool enabled) external {
         Position storage pos = positions[token];
         if (pos.tokenId == 0) revert UnknownToken();

@@ -53,35 +53,21 @@ interface IPoolManager {
 
 // Blitzr — https://blitzr.fun
 //
-// V4 counterpart to BlitzrLocker, adapted for the singleton PoolManager + hooks model.
-// One shared hook instance is attached to every xBlitzr pool (same pattern as one shared
-// BlitzrLocker serving every V3 launch). It enforces two permanent invariants on any pool
-// that uses it:
-//
-//   1. Liquidity can only ever be added once, by the launcher, at launch time
-//      (beforeAddLiquidity reverts for any other caller).
-//   2. Principal liquidity can never be removed by anyone, ever, including the owner
-//      (beforeRemoveLiquidity reverts on any nonzero delta, forever).
-//
-// Two separate revenue streams exist side by side:
-//   - The pool's own LP fee (1 %, set in PoolKey.fee by the launcher) accrues to the locked
-//     position as ordinary Uniswap fee growth and is split between creator and platform
-//     (XBlitzrLauncher.creatorBps/platformBps, adjustable). Since principal can never be
-//     removed, this fee is realized via a zero-delta "poke" — beforeRemoveLiquidity allows
-//     liquidityDelta == 0, but only when called by the launcher (the position's owner in
-//     PoolManager's accounting). XBlitzrLauncher.collectPoolFees() drives this.
-//   - The hook's own cut (hookFeeBps, taken independently of the pool fee) is skimmed live on
-//     every swap via afterSwap's returned delta and goes entirely to the platform wallet — no
-//     claim step, revenue lands immediately.
+// V4 counterpart to BlitzrLocker, one shared hook instance attached to every xBlitzr pool.
+// Enforces two permanent invariants: liquidity can only be added once, by the launcher, at
+// launch time (beforeAddLiquidity); and principal can never be removed by anyone, ever
+// (beforeRemoveLiquidity). Two revenue streams both split creatorBps/platformBps — the pool's own
+// LP fee, realized via a zero-delta poke since principal can't be removed, and the hook's own
+// swap-fee cut, skimmed live in afterSwap. Both read the SAME ratio from this contract so there's
+// one number to keep in sync, not two.
 contract XBlitzrHook {
     using CurrencyLibrary   for Currency;
     using BalanceDeltaLibrary for BalanceDelta;
     using PoolIdLibrary     for PoolKey;
 
-    // Hook permission bits this contract's deployed address must encode in its low bits —
-    // verified against Uniswap/v4-core's Hooks.sol (github.com/Uniswap/v4-core, src/libraries/Hooks.sol).
-    // Achieving this requires deploying via CREATE2 with a mined salt; see XBLITZR.md →
-    // "Deploying the Hook". A normal `new XBlitzrHook(...)` will NOT produce a valid hook address.
+    // Hook permission bits this contract's deployed address must encode — requires CREATE2 with
+    // a mined salt (see XBLITZR.md → "Deploying the Hook"); a plain `new XBlitzrHook(...)` will
+    // NOT produce a valid hook address.
     uint160 internal constant ALL_HOOK_MASK = uint160((1 << 14) - 1);
     uint160 internal constant BEFORE_ADD_LIQUIDITY_FLAG     = 1 << 11;
     uint160 internal constant BEFORE_REMOVE_LIQUIDITY_FLAG  = 1 << 9;
@@ -91,11 +77,15 @@ contract XBlitzrHook {
         BEFORE_ADD_LIQUIDITY_FLAG | BEFORE_REMOVE_LIQUIDITY_FLAG |
         AFTER_SWAP_FLAG | AFTER_SWAP_RETURNS_DELTA_FLAG;
 
-    // Cut taken out of every swap's unspecified-currency leg, paid entirely to platformWallet.
-    // Separate from and in addition to the pool's own 1 % LP fee (set in PoolKey.fee by the
-    // launcher, split between creator and platform) — see the contract-level comment above.
-    uint256 public hookFeeBps = 30; // 0.3 %, owner-adjustable via setHookFeeBps
+    // Cut taken out of every swap's unspecified-currency leg — separate from and in addition to
+    // the pool's own 1% LP fee (set in PoolKey.fee by the launcher).
+    uint256 public hookFeeBps = 35; // 0.35 %, owner-adjustable via setHookFeeBps
     uint256 private constant BPS = 10_000;
+
+    // Single source of truth for the creator/platform split, also read by
+    // XBlitzrLauncher.collectPoolFees for the pool LP fee — one ratio, not two that could drift.
+    uint256 public creatorBps  = 8_000; // 80 %, owner-adjustable via setFeeBps
+    uint256 public platformBps = 2_000; // 20 %, owner-adjustable via setFeeBps
 
     error NotOwner();
     error NotLauncher();
@@ -134,10 +124,11 @@ contract XBlitzrHook {
     address[] public allTokens;
 
     event PositionRegistered(address indexed token, bytes32 indexed poolId, address feeWallet);
-    event SwapFeeCaptured(address indexed token, address indexed currency, uint256 platformCut);
+    event SwapFeeCaptured(address indexed token, address indexed currency, uint256 creatorCut, uint256 platformCut);
     event LauncherSet(address indexed launcher);
     event PlatformWalletSet(address indexed wallet);
     event HookFeeBpsSet(uint256 bps);
+    event FeeBpsSet(uint256 creatorBps, uint256 platformBps);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event TokenCTO(address indexed token, address indexed oldFeeWallet, address indexed newFeeWallet);
     event CTOApplied(address indexed token, address indexed applicant, address proposedFeeWallet, uint256 feePaid);
@@ -147,20 +138,14 @@ contract XBlitzrHook {
     modifier onlyLauncher()    { if (msg.sender != launcher)              revert NotLauncher();    _; }
     modifier onlyPoolManager() { if (msg.sender != address(poolManager))  revert NotPoolManager(); _; }
 
-    // owner_ is an explicit constructor argument rather than `msg.sender` — this contract must
-    // be deployed via CREATE2 through a shared deterministic deployment proxy (see "Deploying
-    // the Hook" in XBLITZR.md) to land on a valid hook-flag address, and inside that deployment
-    // `msg.sender` is the proxy itself, not the deploying EOA. Using `msg.sender` here would
-    // permanently lock `owner` to an address nobody controls — confirmed by fork-testing this
-    // exact deployment path against the real CREATE2 deployment proxy on mainnet.
+    // owner_ is an explicit arg, not `msg.sender` — deployment goes through a CREATE2 proxy (see
+    // XBLITZR.md), so `msg.sender` here would be that proxy, not the real owner.
     constructor(address poolManager_, address platformWallet_, address owner_) {
         if (poolManager_    == address(0)) revert ZeroAddress();
         if (platformWallet_ == address(0)) revert ZeroAddress();
         if (owner_          == address(0)) revert ZeroAddress();
-        // Deployer must CREATE2-mine a salt producing this exact flag pattern beforehand —
-        // see XBLITZR.md. Checked against ALL_HOOK_MASK, not just REQUIRED_FLAGS, so a mined
-        // salt that accidentally sets an unrelated flag (e.g. BEFORE_SWAP) is rejected too —
-        // matches the exact-match semantics of v4-core's Hooks.validateHookPermissions.
+        // Checked against ALL_HOOK_MASK, not just REQUIRED_FLAGS, so a mined salt that
+        // accidentally sets an unrelated flag is rejected too.
         if (uint160(address(this)) & ALL_HOOK_MASK != REQUIRED_FLAGS) revert BadHookAddress();
 
         poolManager    = IPoolManager(poolManager_);
@@ -186,14 +171,19 @@ contract XBlitzrHook {
         emit HookFeeBpsSet(bps_);
     }
 
+    function setFeeBps(uint256 creator_, uint256 platform_) external onlyOwner {
+        if (creator_ + platform_ != BPS) revert InvalidBps();
+        creatorBps  = creator_;
+        platformBps = platform_;
+        emit FeeBpsSet(creator_, platform_);
+    }
+
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddress();
         emit OwnershipTransferred(owner, newOwner);
         owner = newOwner;
     }
 
-    // Reassigns a token's creator fee wallet — a community takeover (CTO) lever for when the
-    // original creator is unreachable or has abandoned the project.
     function ctoFeeWallet(address token, address newFeeWallet) external onlyOwner {
         Position storage pos = positions[token];
         if (pos.feeWallet == address(0)) revert UnknownToken();
@@ -208,9 +198,8 @@ contract XBlitzrHook {
         emit CTOFeeSet(fee_);
     }
 
-    // Public entry point for proposing a community takeover. Gated by ctoFee (paid to
-    // platformWallet) so bots can't spam applications for free; the owner still reviews and
-    // executes via ctoFeeWallet — this only records the proposal. The fee is non-refundable.
+    // Gated by ctoFee (non-refundable, paid to platformWallet) so bots can't spam applications;
+    // owner still reviews and executes via ctoFeeWallet — this only records the proposal.
     function applyForCTO(address token, address proposedFeeWallet) external payable {
         Position storage pos = positions[token];
         if (pos.feeWallet == address(0)) revert UnknownToken();
@@ -248,8 +237,7 @@ contract XBlitzrHook {
         return allTokens.length;
     }
 
-    // --- hook callbacks — PoolManager only calls these because REQUIRED_FLAGS marks them
-    //     active in this contract's address; any other flag stays off and is never invoked. ---
+    // --- hook callbacks ---
 
     function beforeAddLiquidity(address sender, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         external view onlyPoolManager returns (bytes4)
@@ -258,12 +246,9 @@ contract XBlitzrHook {
         return this.beforeAddLiquidity.selector;
     }
 
-    // Reverts on any actual removal (liquidityDelta < 0) from anyone, forever — principal is
-    // permanently locked. But allows a zero-delta "poke" (fee-only, no principal change) from
-    // the launcher specifically, since it's the position's owner in PoolManager's accounting and
-    // is the only address that could ever successfully call modifyLiquidity on this position.
+    // Allows a zero-delta "poke" (fee-only) from the launcher; any nonzero delta reverts.
     // liquidityDelta is never positive here — PoolManager routes delta > 0 through
-    // beforeAddLiquidity instead (see Hooks.beforeModifyLiquidity), so != 0 here means < 0.
+    // beforeAddLiquidity instead.
     function beforeRemoveLiquidity(
         address sender,
         PoolKey calldata,
@@ -275,9 +260,6 @@ contract XBlitzrHook {
         return this.beforeRemoveLiquidity.selector;
     }
 
-    // Skims hookFeeBps off the unspecified-currency leg of every swap and routes it straight
-    // to platformWallet via take() — no intermediate custody in this contract. Separate from
-    // the pool-fee poke XBlitzrLauncher.collectPoolFees() drives.
     function afterSwap(
         address,
         PoolKey calldata key,
@@ -289,7 +271,6 @@ contract XBlitzrHook {
         Position storage pos = positions[token];
         if (pos.feeWallet == address(0)) return (this.afterSwap.selector, 0);
 
-        // Unspecified currency = whichever leg wasn't fixed by the swapper's amountSpecified.
         // See XBLITZR.md → "Hook Fee Mechanics" for the derivation of this condition.
         bool unspecifiedIsCurrency0 = !(params.zeroForOne == (params.amountSpecified < 0));
         int128 unspecifiedAmount = unspecifiedIsCurrency0 ? delta.amount0() : delta.amount1();
@@ -303,9 +284,13 @@ contract XBlitzrHook {
 
         Currency feeCurrency = unspecifiedIsCurrency0 ? key.currency0 : key.currency1;
 
-        poolManager.take(feeCurrency, platformWallet, cut);
+        // Platform's share absorbs the rounding remainder — matches _executePoke's convention.
+        uint256 creatorCut = cut * creatorBps / BPS;
+        uint256 platformCut = cut - creatorCut;
+        if (creatorCut  > 0) poolManager.take(feeCurrency, pos.feeWallet,  creatorCut);
+        if (platformCut > 0) poolManager.take(feeCurrency, platformWallet, platformCut);
 
-        emit SwapFeeCaptured(token, Currency.unwrap(feeCurrency), cut);
+        emit SwapFeeCaptured(token, Currency.unwrap(feeCurrency), creatorCut, platformCut);
 
         return (this.afterSwap.selector, int128(int256(cut)));
     }

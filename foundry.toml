@@ -8,6 +8,48 @@ solc_version = "0.8.32"
 optimizer = true
 optimizer_runs = 200
 via_ir = true
+# src = "." makes forge treat every .sol file under the repo root as an independent compile
+# target, which would otherwise sweep in lib/v4-core's own dev-only dependencies
+# (openzeppelin-contracts, solmate) and test suite — pulled in solely for the fork profile below,
+# and not buildable under this project's pinned solc_version. The default profile never imports
+# from v4-core at all, so excluding it here is free.
+# test-fork/**: forge's test *discovery* isn't gated purely by the `test` directory setting —
+# with src = ".", anything under src compiling to a contract with test-shaped functions gets
+# picked up and run too, regardless of which directory it's in. Without this exclusion, a plain
+# `forge test` (no FOUNDRY_PROFILE=fork) would silently also run the network-dependent mainnet
+# fork tests. Excluding the directory here is what actually keeps them opt-in.
+# lib/openzeppelin-contracts-upgradeable/{test,lib/{erc4626-tests,forge-std,halmos-cheatcodes}}
+# and the same two subpaths one level down (its own nested openzeppelin-contracts dependency):
+# BlitzrSwapRouter imports real source from both openzeppelin-contracts-upgradeable/contracts/
+# and its nested lib/openzeppelin-contracts/contracts/ (several upgradeable contracts still pull
+# stateless utils from the base package) — those must stay reachable. Only each package's own
+# dev-only test suite and test-only dependencies are excluded, same reasoning as lib/v4-core above.
+skip = [
+    "lib/v4-core/**",
+    "test-fork/**",
+    "lib/openzeppelin-contracts-upgradeable/test/**",
+    "lib/openzeppelin-contracts-upgradeable/fv/**",
+    "lib/openzeppelin-contracts-upgradeable/lib/erc4626-tests/**",
+    "lib/openzeppelin-contracts-upgradeable/lib/forge-std/**",
+    "lib/openzeppelin-contracts-upgradeable/lib/halmos-cheatcodes/**",
+    "lib/openzeppelin-contracts-upgradeable/lib/openzeppelin-contracts/test/**",
+    "lib/openzeppelin-contracts-upgradeable/lib/openzeppelin-contracts/fv/**",
+    "lib/openzeppelin-contracts-upgradeable/lib/openzeppelin-contracts/lib/**",
+]
+
+# Mainnet-fork integration tests against real deployed Uniswap V3/V4 contracts — network-
+# dependent and not part of the default `forge test` run. Invoke with:
+#   FOUNDRY_PROFILE=fork forge test
+# `src` is scoped to test-fork/ itself (not "." like the default profile) so forge only compiles
+# what test-fork's own relative imports actually reach — contracts/, xBlitzr/, test/utils/, and
+# the specific lib/v4-core/src files imported. With src = "." here, forge would instead try to
+# compile every .sol file under the repo root as an independent target, including v4-core's own
+# nested dev-only dependencies, most of which aren't even meant to build outside v4-core's own
+# repo. `skip` is reset to empty since this profile actually needs lib/v4-core reachable.
+[profile.fork]
+src = "test-fork"
+test = "test-fork"
+skip = []
 
 [fmt]
 line_length = 100

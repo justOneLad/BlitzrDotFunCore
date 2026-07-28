@@ -65,6 +65,12 @@ interface IWETH {
     function deposit() external payable;
 }
 
+// Guarded-launch-mode-only calls — see BlitzrTokenGuarded.sol.
+interface IBlitzrGuardedToken {
+    function initGuard(address pool_, uint256 windowBlocks_, uint256 maxVestBlocks_) external;
+    function setGuardBypassOnce(address account) external;
+}
+
 // SwapRouter02 ABI (no `deadline` field — deadline enforcement lives in that router's
 // separate `multicall` wrapper, unlike the original Uniswap V3 `SwapRouter`).
 interface ISwapRouter {
@@ -80,8 +86,7 @@ interface ISwapRouter {
     function exactInputSingle(ExactInputSingleParams calldata params)
         external payable returns (uint256 amountOut);
 
-    // Multi-hop variant — used when the quote token isn't WETH, routing
-    // WETH -> quoteToken -> blitzrToken through whatever pools already exist.
+    // Multi-hop — used when the quote token isn't WETH.
     struct ExactInputParams {
         bytes   path;
         address recipient;
@@ -105,6 +110,7 @@ contract BlitzrLauncher {
     error TransferFailed();
     error ApprovalFailed();
     error InvalidTickRange();
+    error GuardedModeNotConfigured();
 
     uint256 public constant TOTAL_SUPPLY = 1_000_000_000e18; // 100 % seeded one-sided into the pool
 
@@ -113,9 +119,8 @@ contract BlitzrLauncher {
     int24  private constant MAX_TICK     =  887_200;
     int24  private constant TICK_SPACING =  200;   // spacing for 1 % tier
 
-    // Matches BlitzrLocker.BURN_ADDRESS — exempted from the anti-bot cap here so BlitzrLocker's
-    // burn transfers (if enabled for a given token) don't eventually trip the cap once enough
-    // has accumulated there during the anti-bot window.
+    // Matches BlitzrLocker.BURN_ADDRESS — exempted from the anti-bot cap so accumulating burns
+    // don't eventually trip it.
     address private constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     struct DexConfig {
@@ -142,6 +147,12 @@ contract BlitzrLauncher {
     uint256      public launchFee;       // charged in native ETH/BNB on every launch, regardless of quote token
     uint256      public antiBotBlocks = 10; // blocks after launch during which BlitzrToken caps any wallet at 2.5% of supply
 
+    // address(0) leaves launchGuarded disabled until the owner configures it. windowBlocks is the
+    // creator's per-launch choice; guardMaxVestBlocks is a protocol-level knob only the owner
+    // sets (~30 days of blocks @ 12s/block by default).
+    address      public guardedTokenImpl;
+    uint256      public guardMaxVestBlocks = 216_000; // ~30 days @ 12s/block
+
     event TokenLaunched(
         address indexed token,
         address indexed creator,
@@ -161,6 +172,9 @@ contract BlitzrLauncher {
     event MarketCapRefSet(address indexed token, uint256 marketCapRef);
     event ETHRescued(address indexed to, uint256 amount);
     event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
+    event GuardedTokenImplSet(address indexed impl);
+    event GuardMaxVestBlocksSet(uint256 blocks);
+    event GuardedTokenLaunched(address indexed token, uint256 windowEndBlock, uint256 maxVestBlocks);
 
     modifier onlyOwner() { if (msg.sender != owner) revert NotOwner(); _; }
 
@@ -224,6 +238,17 @@ contract BlitzrLauncher {
     function setAntiBotBlocks(uint256 blocks_) external onlyOwner {
         antiBotBlocks = blocks_;
         emit AntiBotBlocksSet(blocks_);
+    }
+
+    function setGuardedTokenImpl(address impl_) external onlyOwner {
+        guardedTokenImpl = impl_;
+        emit GuardedTokenImplSet(impl_);
+    }
+
+    // 0 is valid — disables the vesting lock while keeping the liquid/burn split active.
+    function setGuardMaxVestBlocks(uint256 blocks_) external onlyOwner {
+        guardMaxVestBlocks = blocks_;
+        emit GuardMaxVestBlocksSet(blocks_);
     }
 
     function setMarketCapRef(address token_, uint256 ref_) external onlyOwner {
@@ -307,28 +332,22 @@ contract BlitzrLauncher {
         address factory_,
         address quoteToken_
     ) private returns (address pool, uint256 tokenId) {
-        // Access dex/quote config directly from storage — avoids two memory-pointer stack slots
-        // that legacy codegen would keep live for the entire function body.
         if (!dexes[factory_].enabled)          revert UnsupportedDex();
         if (!quoteTokens[quoteToken_].enabled)  revert UnsupportedQuoteToken();
         if (msg.value < launchFee)              revert WrongFee();
 
-        // Fee is always charged in native ETH/BNB, regardless of quote token — sent straight
-        // to the platform wallet, never touching the pool. Anything above the fee is spent on
-        // an instant buy after the pool is seeded.
         (bool feeOk,) = launchFeeWallet.call{value: launchFee}("");
         if (!feeOk) revert TransferFailed();
         uint256 extraEth = msg.value - launchFee;
 
-        // Determine token ordering (V3 requires token0 < token1 by address).
+        // V3 requires token0 < token1 by address.
         (address token0, address token1) = token < quoteToken_
             ? (token,       quoteToken_)
             : (quoteToken_, token      );
 
-        // A pool can already exist at this (token0, token1, FEE_TIER) key if someone front-ran
-        // createPool() with our predicted clone address — createPool() is permissionless on the
-        // DEX factory. An uninitialized shell is harmless: we just adopt and initialize it
-        // ourselves. Only a pool someone has *already initialized* is a genuine collision.
+        // A pool can already exist here if someone front-ran createPool() with our predicted
+        // clone address (permissionless on the DEX factory) — an uninitialized shell is harmless
+        // to adopt; only an already-initialized pool is a genuine collision.
         address existingPool = IUniswapV3Factory(factory_).getPool(token0, token1, FEE_TIER);
         if (existingPool == address(0)) {
             pool = IUniswapV3Factory(factory_).createPool(token0, token1, FEE_TIER);
@@ -338,18 +357,15 @@ contract BlitzrLauncher {
             pool = existingPool;
         }
 
-        // Initialise at a price targeting marketCapRef for the full TOTAL_SUPPLY.
         IUniswapV3Pool(pool).initialize(
             _computeSqrtPriceX96(token, quoteToken_, quoteTokens[quoteToken_].marketCapRef)
         );
 
         // Must happen before the mint below: the pool is about to receive ~100% of supply as
         // locked liquidity, which would itself trip the anti-bot cap if not exempted first.
-        // BURN_ADDRESS is exempted too since its balance only ever grows.
         IBlitzrToken(token).setExempt(pool, true);
         IBlitzrToken(token).setExempt(BURN_ADDRESS, true);
 
-        // Tick setup, mint, and register extracted to avoid stack-too-deep in legacy codegen.
         tokenId = _mintAndRegister(
             dexes[factory_].positionManager,
             token,
@@ -357,13 +373,11 @@ contract BlitzrLauncher {
             token0, token1, pool
         );
 
-        // Instant buy extracted to avoid stack-too-deep during ExactInputSingleParams construction.
         if (extraEth > 0) {
             _doInstantBuy(dexes[factory_].router, quoteToken_, token, extraEth, quoteTokens[quoteToken_].wethPairFee);
         }
 
-        // Sweep any mint-rounding dust left in this contract back to the creator — the
-        // full supply is seeded one-sided, so no deliberate allocation is held back.
+        // Sweep any mint-rounding dust back to the creator — the full supply is seeded one-sided.
         uint256 creatorTokens = IBlitzrToken(token).balanceOf(address(this));
         if (creatorTokens > 0) IBlitzrToken(token).transfer(msg.sender, creatorTokens);
 
@@ -376,12 +390,92 @@ contract BlitzrLauncher {
         );
     }
 
+    // Same as launch(), but clones guardedTokenImpl instead — every purchase from the pool during
+    // windowBlocks_ gets split liquid/vested/burned (see BlitzrTokenGuarded.sol). Reverts if the
+    // owner hasn't configured guardedTokenImpl yet.
+    function launchGuarded(
+        string calldata name_,
+        string calldata symbol_,
+        string calldata metaURI_,
+        address         feeWallet_,
+        address         factory_,
+        address         quoteToken_,
+        uint256         windowBlocks_
+    ) external payable returns (address token, address pool, uint256 tokenId) {
+        if (guardedTokenImpl == address(0)) revert GuardedModeNotConfigured();
+        token = _deployAndInitGuarded(name_, symbol_, metaURI_);
+        (pool, tokenId) = _setupAndRegisterGuarded(token, feeWallet_, factory_, quoteToken_, windowBlocks_);
+    }
+
+    function _setupAndRegisterGuarded(
+        address token,
+        address feeWallet_,
+        address factory_,
+        address quoteToken_,
+        uint256 windowBlocks_
+    ) private returns (address pool, uint256 tokenId) {
+        if (!dexes[factory_].enabled)          revert UnsupportedDex();
+        if (!quoteTokens[quoteToken_].enabled)  revert UnsupportedQuoteToken();
+        if (msg.value < launchFee)              revert WrongFee();
+
+        (bool feeOk,) = launchFeeWallet.call{value: launchFee}("");
+        if (!feeOk) revert TransferFailed();
+        uint256 extraEth = msg.value - launchFee;
+
+        (address token0, address token1) = token < quoteToken_
+            ? (token,       quoteToken_)
+            : (quoteToken_, token      );
+
+        address existingPool = IUniswapV3Factory(factory_).getPool(token0, token1, FEE_TIER);
+        if (existingPool == address(0)) {
+            pool = IUniswapV3Factory(factory_).createPool(token0, token1, FEE_TIER);
+        } else {
+            (uint160 existingPrice,,,,,,) = IUniswapV3Pool(existingPool).slot0();
+            if (existingPrice != 0) revert PoolAlreadyExists();
+            pool = existingPool;
+        }
+
+        IUniswapV3Pool(pool).initialize(
+            _computeSqrtPriceX96(token, quoteToken_, quoteTokens[quoteToken_].marketCapRef)
+        );
+
+        IBlitzrToken(token).setExempt(pool, true);
+        IBlitzrToken(token).setExempt(BURN_ADDRESS, true);
+
+        // Must happen before _mintAndRegister so the split is live from the first possible swap.
+        IBlitzrGuardedToken(token).initGuard(pool, windowBlocks_, guardMaxVestBlocks);
+
+        tokenId = _mintAndRegister(
+            dexes[factory_].positionManager,
+            token,
+            feeWallet_ == address(0) ? msg.sender : feeWallet_,
+            token0, token1, pool
+        );
+
+        if (extraEth > 0) {
+            // Creator's own instant buy isn't a sniper — exempt just this purchase from the
+            // split (see BlitzrTokenGuarded.guardBypassOnce); the anti-bot cap still applies.
+            IBlitzrGuardedToken(token).setGuardBypassOnce(msg.sender);
+            _doInstantBuy(dexes[factory_].router, quoteToken_, token, extraEth, quoteTokens[quoteToken_].wethPairFee);
+        }
+
+        uint256 creatorTokens = IBlitzrToken(token).balanceOf(address(this));
+        if (creatorTokens > 0) IBlitzrToken(token).transfer(msg.sender, creatorTokens);
+
+        IBlitzrToken(token).renounceOwnership();
+
+        emit TokenLaunched(
+            token, msg.sender, factory_, quoteToken_,
+            feeWallet_ == address(0) ? msg.sender : feeWallet_,
+            pool, tokenId
+        );
+        emit GuardedTokenLaunched(token, block.number + windowBlocks_, guardMaxVestBlocks);
+    }
+
     receive() external payable {}
 
-    // Wraps the excess ETH to WETH and buys blitzr tokens for the creator. Direct single-hop
-    // swap when the quote token is WETH itself; otherwise multihops WETH -> quoteToken ->
-    // blitzrToken through whichever pools already exist (quoteToken/blitzrToken is the one we
-    // just seeded; WETH/quoteToken must already have real liquidity on this DEX).
+    // Direct swap when the quote token is WETH; otherwise multihops WETH -> quoteToken ->
+    // blitzrToken through whichever pools already exist.
     function _doInstantBuy(
         address router_,
         address quoteToken_,
@@ -412,9 +506,8 @@ contract BlitzrLauncher {
         }
     }
 
-    // Tick setup, mint, and locker registration in one frame.
-    // tick/amount vars are scoped to the inner block so they are popped before the
-    // 7-argument registerPosition call — keeping that call's stack depth in range.
+    // tick/amount vars scoped to the inner block so they're popped before the 7-argument
+    // registerPosition call, keeping stack depth in range.
     function _mintAndRegister(
         address positionManager_,
         address token,
@@ -474,11 +567,20 @@ contract BlitzrLauncher {
         string calldata symbol_,
         string calldata metaURI_
     ) private returns (address token) {
-        // Salted by caller + block + the launch params themselves, so the resulting clone
-        // address can't be precomputed and squatted ahead of time by an unrelated third party
-        // scanning a predictable counter — only by racing this exact pending transaction.
+        // Salted by caller + block + params so the clone address can't be precomputed and
+        // squatted ahead of time — only raced within this exact pending transaction.
         bytes32 salt = keccak256(abi.encodePacked(msg.sender, block.timestamp, name_, symbol_, metaURI_));
         token = _clone(tokenImpl, salt);
+        IBlitzrToken(token).initBlitzr(name_, symbol_, metaURI_, address(this), antiBotBlocks);
+    }
+
+    function _deployAndInitGuarded(
+        string calldata name_,
+        string calldata symbol_,
+        string calldata metaURI_
+    ) private returns (address token) {
+        bytes32 salt = keccak256(abi.encodePacked(msg.sender, block.timestamp, name_, symbol_, metaURI_, "guarded"));
+        token = _clone(guardedTokenImpl, salt);
         IBlitzrToken(token).initBlitzr(name_, symbol_, metaURI_, address(this), antiBotBlocks);
     }
 
@@ -504,9 +606,7 @@ contract BlitzrLauncher {
         return compressed * TICK_SPACING;
     }
 
-    // EIP-1167 minimal proxy — 55-byte deployment (10 creation + 45 runtime).
-    // CREATE2 (not CREATE) so the resulting address depends on `salt`, not just this
-    // contract's nonce — see _deployAndInit for why that matters.
+    // EIP-1167 minimal proxy, CREATE2 so the address depends on `salt` (see _deployAndInit).
     function _clone(address impl, bytes32 salt) private returns (address instance) {
         assembly {
             let ptr := mload(0x40)

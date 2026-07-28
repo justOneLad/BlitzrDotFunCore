@@ -38,10 +38,10 @@ BlitzrLauncher
   └─ transfer(remaining mint-rounding dust → creator)
 
 BlitzrLocker  (holds LP NFTs forever)
-  └─ claimFees(token)  →  the launched-token leg: split 85% feeWallet + 15% platformWallet by
+  └─ claimFees(token)  →  the launched-token leg: split 80% feeWallet + 20% platformWallet by
                           default, or if burn is enabled for that token, sent entirely to
                           BURN_ADDRESS instead
-                        →  the quote-token leg: always split 85% feeWallet + 15% platformWallet
+                        →  the quote-token leg: always split 80% feeWallet + 20% platformWallet
 ```
 
 The quote token is purely the pool's pairing partner — the creator never sends or approves
@@ -152,8 +152,8 @@ Default values — updatable by the locker owner via `setFeeBps(creator, platfor
 
 | Recipient | Default share | Interaction |
 |-----------|--------------|-------------|
-| Creator fee wallet | 85 % (8 500 bps) | Initiates `claimFees` |
-| Platform wallet | 15 % (1 500 bps) | Passive recipient |
+| Creator fee wallet | 80 % (8 000 bps) | Initiates `claimFees` |
+| Platform wallet | 20 % (2 000 bps) | Passive recipient |
 
 Fees are distributed atomically. Platform receives the remainder after creator to absorb rounding dust.
 
@@ -250,7 +250,7 @@ ownership at the end of `launch()` — the exemption list is effectively frozen 
 
 ```solidity
 constructor(
-    address platformWallet_  // Receives 15 % of claimed swap fees (default)
+    address platformWallet_  // Receives 20 % of claimed swap fees (default)
 )
 ```
 
@@ -416,44 +416,3 @@ pending         = liquidity × (feeGrowthInside − feeGrowthInsideLast) / 2¹²
 ```
 
 All arithmetic is `unchecked` (wrapping) per the Uniswap V3 spec.
-
----
-
-## Arc Variant
-
-`BlitzrLauncherArc.sol` (`BlitzrLauncherArc`) is the same launcher rebuilt for Arc, whose native
-gas token **is** USDC (6 decimals) rather than ETH/BNB, mirrored as an ERC20 at the fixed,
-network-wide address `0x3600000000000000000000000000000000000000` — native balance and that
-ERC20's `balanceOf` are always in sync, so there is no WETH on Arc and no wrap/unwrap step is
-ever needed. Everything else — DEX registry, quote-token registration, one-sided tick math,
-anti-bot cap, locker registration — is unchanged.
-
-Differences from `BlitzrLauncher`:
-
-- **No `weth_` constructor param.** `USDC` is a hardcoded `constant`
-  (`0x3600000000000000000000000000000000000000`), not per-deployment config — it's fixed by the
-  network itself, so there's nothing to misconfigure at deploy time.
-- **No wrap step.** `_doInstantBuy` skips the `IWETH.deposit{value: extraUsdc}()` call entirely —
-  the native value this contract just received is already spendable as `USDC` ERC20 balance.
-- **`QuoteToken.wethPairFee` → `nativePairFee`** (and the matching `addQuoteToken` param), purely
-  a rename — same role, still the fee tier of an existing `USDC`/quoteToken pool used for the
-  multihop instant-buy path when `quoteToken != USDC`.
-- **`USDC` defaults to `marketCapRef = 5e6`** (~$5 at 6 decimals) in the constructor, versus
-  `5e18` (5 WETH) for the BSC contract's WETH default.
-- Launch fee, DEX registry, and quote-token mechanics are otherwise byte-for-byte identical —
-  `launchFee` is still a single global native-value figure, just denominated in 6-decimal USDC on
-  Arc instead of 18-decimal ETH/BNB (pass amounts accordingly when configuring it).
-
-### Constructor Arguments (BlitzrLauncherArc)
-
-```solidity
-constructor(
-    address tokenImpl_,          // BlitzrToken implementation (deployed separately)
-    address locker_,             // BlitzrLocker (set its launcher to this address after deploy)
-    address launchFeeWallet_,    // Platform wallet that receives per-launch fees (native USDC)
-    address initialFactory_,     // Factory of the first supported V3 DEX
-    address initialPositionMgr_, // Position manager of the first supported V3 DEX
-    address initialRouter_,      // Swap router of the first supported V3 DEX
-    uint256 launchFee_           // Global launch fee, in native USDC raw units (6 decimals)
-)
-```

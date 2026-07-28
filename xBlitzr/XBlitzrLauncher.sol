@@ -67,6 +67,9 @@ interface IXBlitzrHook {
     function registerPosition(address token, PoolKey calldata key, address feeWallet) external;
     function positions(address token) external view returns (address feeWallet, Currency currency0, Currency currency1);
     function platformWallet() external view returns (address);
+    // Single source of truth for the creator/platform split — see XBlitzrHook.sol.
+    function creatorBps() external view returns (uint256);
+    function platformBps() external view returns (uint256);
 }
 
 interface IBlitzrToken {
@@ -75,6 +78,12 @@ interface IBlitzrToken {
     function transfer(address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
     function setExempt(address account, bool exempt_) external;
+}
+
+// Guarded-launch-mode-only calls — see contracts/BlitzrTokenGuarded.sol.
+interface IBlitzrGuardedToken {
+    function initGuard(address pool_, uint256 windowBlocks_, uint256 maxVestBlocks_) external;
+    function setGuardBypassOnce(address account) external;
 }
 
 // Full-precision mulDiv — ported from Uniswap's FullMath.sol (Remco Bloemen's 512-bit
@@ -189,10 +198,9 @@ library LiquidityAmounts {
 // Blitzr — https://blitzr.fun
 //
 // V4 counterpart to BlitzrLauncher. Clones the same BlitzrToken implementation used by the V3
-// stack (contracts/BlitzrToken.sol) and seeds 100 % one-sided liquidity into a V4 pool via the
-// PoolManager singleton, attached to XBlitzrHook. There is no per-DEX registry like V3's
-// dexes[] — V4 is one canonical PoolManager per chain, so that whole surface disappears.
-// Native ETH/BNB is a first-class quote currency in V4 (Currency address(0)), so unlike V3
+// stack and seeds 100% one-sided liquidity into a V4 pool via the PoolManager singleton, attached
+// to XBlitzrHook. No per-DEX registry like V3's dexes[] — V4 is one canonical PoolManager per
+// chain. Native ETH/BNB is a first-class quote currency (Currency address(0)), so unlike V3
 // there's no WETH-wrapping step for the common case.
 contract XBlitzrLauncher is IUnlockCallback {
     using CurrencyLibrary   for Currency;
@@ -211,6 +219,7 @@ contract XBlitzrLauncher is IUnlockCallback {
     error UnknownToken();
     error InsufficientOutput();
     error InvalidBps();
+    error GuardedModeNotConfigured();
 
     uint256 public constant TOTAL_SUPPLY = 1_000_000_000e18;
 
@@ -218,22 +227,16 @@ contract XBlitzrLauncher is IUnlockCallback {
     int24 private constant MIN_TICK     = -887_200;
     int24 private constant MAX_TICK     =  887_200;
 
-    // Uniswap fee units are hundredths of a bip (1e-6) — 10_000 = 1 %. This is the pool's own
-    // LP fee, separate from XBlitzrHook's hookFeeBps. It accrues to the locked position and is
-    // realized via collectPoolFees() below: both the quote-currency and token-currency legs are
-    // split between creator and platform per creatorBps/platformBps (owner-adjustable).
+    // Uniswap fee units are hundredths of a bip (1e-6) — 10_000 = 1%. Realized via
+    // collectPoolFees() below, split creatorBps/platformBps read live from the hook.
     uint24 private constant POOL_FEE = 10_000;
-
-    uint256 public creatorBps  = 8_500; // 85 %, owner-adjustable via setFeeBps
-    uint256 public platformBps = 1_500; // 15 %, owner-adjustable via setFeeBps
     uint256 private constant BPS = 10_000;
 
     struct QuoteToken {
         uint256 marketCapRef;
         bool    enabled;
-        // Identifies an existing, liquid native/quoteToken pool used to route the first hop of
-        // a multi-hop instant buy when this quote token isn't native. Unused (left zero) for
-        // the native entry itself, which never needs a first hop.
+        // An existing, liquid native/quoteToken pool for routing the first hop of a multi-hop
+        // instant buy. Unused for the native entry itself.
         uint24  refFee;
         int24   refTickSpacing;
         address refHooks;
@@ -250,10 +253,11 @@ contract XBlitzrLauncher is IUnlockCallback {
         uint24   refFee;
         int24    refTickSpacing;
         address  refHooks;
+        bool     guarded;       // true for launchGuarded() — see _executeLaunch's guarded branch
+        uint256  windowBlocks;  // guarded-mode only, creator-chosen; ignored when !guarded
     }
 
-    // Persisted per launch so collectPoolFees() can replay the exact poke later — PoolManager
-    // only lets the original modifyLiquidity caller (this contract) touch this position again.
+    // Persisted per launch so collectPoolFees() can replay the exact poke later.
     struct PoolFeePosition {
         PoolKey key;
         int24   tickLower;
@@ -271,6 +275,12 @@ contract XBlitzrLauncher is IUnlockCallback {
     uint256      public launchFee;
     uint256      public antiBotBlocks = 10; // blocks after launch during which BlitzrToken caps any wallet at 2.5% of supply
 
+    // address(0) leaves launchGuarded disabled until the owner configures it. windowBlocks is the
+    // creator's per-launch choice; guardMaxVestBlocks is a protocol-level knob only the owner
+    // sets (~30 days of blocks @ 12s/block by default).
+    address      public guardedTokenImpl;
+    uint256      public guardMaxVestBlocks = 216_000; // ~30 days @ 12s/block
+
     event TokenLaunched(
         address indexed token,
         address indexed creator,
@@ -287,6 +297,9 @@ contract XBlitzrLauncher is IUnlockCallback {
     event ETHRescued(address indexed to, uint256 amount);
     event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event GuardedTokenImplSet(address indexed impl);
+    event GuardMaxVestBlocksSet(uint256 blocks);
+    event GuardedTokenLaunched(address indexed token, uint256 windowEndBlock, uint256 maxVestBlocks);
     event PoolFeesCollected(
         address indexed token,
         address indexed creator,
@@ -296,7 +309,6 @@ contract XBlitzrLauncher is IUnlockCallback {
         uint256 tokenToCreator,
         uint256 tokenToPlatform
     );
-    event FeeBpsSet(uint256 creatorBps, uint256 platformBps);
 
     modifier onlyOwner() { if (msg.sender != owner) revert NotOwner(); _; }
 
@@ -320,7 +332,6 @@ contract XBlitzrLauncher is IUnlockCallback {
         launchFeeWallet = launchFeeWallet_;
         launchFee       = launchFee_;
 
-        // native ETH/BNB — refFee/refTickSpacing/refHooks unused, it never needs a first hop
         quoteTokens[address(0)] = QuoteToken({
             marketCapRef:   5e18,
             enabled:        true,
@@ -353,19 +364,21 @@ contract XBlitzrLauncher is IUnlockCallback {
         emit AntiBotBlocksSet(blocks_);
     }
 
-    function setFeeBps(uint256 creator_, uint256 platform_) external onlyOwner {
-        if (creator_ + platform_ != BPS) revert InvalidBps();
-        creatorBps  = creator_;
-        platformBps = platform_;
-        emit FeeBpsSet(creator_, platform_);
+    function setGuardedTokenImpl(address impl_) external onlyOwner {
+        guardedTokenImpl = impl_;
+        emit GuardedTokenImplSet(impl_);
     }
 
-    // token_ == address(0) re-registers native ETH/BNB's marketCapRef — unlike V3, address(0)
-    // is a valid quote token here (it's V4's native-currency marker), not a banned sentinel.
-    // refFee_/refTickSpacing_/refHooks_ identify an existing, liquid native/token_ pool used to
-    // route the first hop of a multi-hop instant buy — required for any non-native token_, since
-    // there's no way to route native ETH into an instant buy otherwise. Ignored for token_ ==
-    // address(0), which never needs a first hop.
+    // 0 is valid — disables the vesting lock while keeping the liquid/burn split active.
+    function setGuardMaxVestBlocks(uint256 blocks_) external onlyOwner {
+        guardMaxVestBlocks = blocks_;
+        emit GuardMaxVestBlocksSet(blocks_);
+    }
+
+    // token_ == address(0) re-registers native ETH/BNB — unlike V3, address(0) is a valid quote
+    // token here (V4's native-currency marker), not a banned sentinel. refFee_/refTickSpacing_/
+    // refHooks_ identify an existing, liquid native/token_ pool for the multi-hop instant-buy
+    // first hop; required for any non-native token_, ignored for native.
     function addQuoteToken(
         address token_,
         uint256 marketCapRef_,
@@ -416,10 +429,8 @@ contract XBlitzrLauncher is IUnlockCallback {
 
     receive() external payable {}
 
-    // minTokensOut_ protects the instant buy (if extraEth > 0) against slippage/sandwiching —
-    // pass 0 for no minimum. Applies to the final token output regardless of whether the buy
-    // is single-hop (native quote) or multi-hop (non-native quote, routed through the quote
-    // token's registered reference pool first).
+    // minTokensOut_ protects the instant buy against slippage/sandwiching — pass 0 for no
+    // minimum. Applies to the final output whether the buy is single-hop or multi-hop.
     function launch(
         string calldata name_,
         string calldata symbol_,
@@ -449,20 +460,61 @@ contract XBlitzrLauncher is IUnlockCallback {
             minTokensOut:   minTokensOut_,
             refFee:         qt.refFee,
             refTickSpacing: qt.refTickSpacing,
-            refHooks:       qt.refHooks
+            refHooks:       qt.refHooks,
+            guarded:        false,
+            windowBlocks:   0
         }))));
         poolId = abi.decode(result, (bytes32));
 
         emit TokenLaunched(token, msg.sender, quoteToken_, resolvedFeeWallet, poolId);
     }
 
-    // Realizes the pool's accrued 1 % LP fee via a zero-delta poke (see PoolFeePosition /
-    // XBlitzrHook.beforeRemoveLiquidity for why only this contract can ever successfully call
-    // modifyLiquidity again on that position). Both the quote-currency and token-currency legs
-    // are split between the creator's feeWallet and platformWallet per creatorBps/platformBps.
-    // Permissionless — the destination and split are fixed by the token/quote identity and the
-    // current bps, not by the caller, so there's no way to misdirect funds by calling this early
-    // or often; it only ever determines *when* fees get realized.
+    // Same as launch(), but clones guardedTokenImpl instead — every purchase from the pool (here,
+    // the PoolManager singleton itself) during windowBlocks_ gets split liquid/vested/burned.
+    // Reverts if the owner hasn't configured guardedTokenImpl yet.
+    function launchGuarded(
+        string calldata name_,
+        string calldata symbol_,
+        string calldata metaURI_,
+        address         feeWallet_,
+        address         quoteToken_,
+        uint256         minTokensOut_,
+        uint256         windowBlocks_
+    ) external payable returns (address token, bytes32 poolId) {
+        if (guardedTokenImpl == address(0)) revert GuardedModeNotConfigured();
+        QuoteToken memory qt = quoteTokens[quoteToken_];
+        if (!qt.enabled) revert UnsupportedQuoteToken();
+        if (msg.value < launchFee) revert WrongFee();
+
+        (bool feeOk,) = launchFeeWallet.call{value: launchFee}("");
+        if (!feeOk) revert TransferFailed();
+        uint256 extraEth = msg.value - launchFee;
+
+        token = _deployAndInitGuarded(name_, symbol_, metaURI_);
+        address resolvedFeeWallet = feeWallet_ == address(0) ? msg.sender : feeWallet_;
+
+        bytes memory result = poolManager.unlock(abi.encode(uint8(0), abi.encode(LaunchCallbackData({
+            token:          token,
+            creator:        msg.sender,
+            feeWallet:      resolvedFeeWallet,
+            quoteCurrency:  Currency.wrap(quoteToken_),
+            marketCapRef:   qt.marketCapRef,
+            extraEth:       extraEth,
+            minTokensOut:   minTokensOut_,
+            refFee:         qt.refFee,
+            refTickSpacing: qt.refTickSpacing,
+            refHooks:       qt.refHooks,
+            guarded:        true,
+            windowBlocks:   windowBlocks_
+        }))));
+        poolId = abi.decode(result, (bytes32));
+
+        emit TokenLaunched(token, msg.sender, quoteToken_, resolvedFeeWallet, poolId);
+        emit GuardedTokenLaunched(token, block.number + windowBlocks_, guardMaxVestBlocks);
+    }
+
+    // Permissionless — destination and split are fixed by token identity and current bps, not
+    // the caller; this only ever determines *when* fees get realized.
     function collectPoolFees(address token) external returns (uint256 quotePaid, uint256 tokenAmount) {
         if (poolFeePositions[token].key.hooks == address(0)) revert UnknownToken();
         bytes memory result = poolManager.unlock(abi.encode(uint8(1), abi.encode(token)));
@@ -523,9 +575,14 @@ contract XBlitzrLauncher is IUnlockCallback {
             ""
         );
 
-        // Must happen before _settleOwed below: PoolManager is about to receive ~100% of supply
-        // as locked liquidity, which would itself trip the anti-bot cap if not exempted first.
+        // Must happen before _settleOwed: PoolManager is about to receive ~100% of supply as
+        // locked liquidity, which would itself trip the anti-bot cap if not exempted first.
         IBlitzrToken(d.token).setExempt(address(poolManager), true);
+
+        // Must happen before _settleOwed so the guarded split is live from the first possible swap.
+        if (d.guarded) {
+            IBlitzrGuardedToken(d.token).initGuard(address(poolManager), d.windowBlocks, guardMaxVestBlocks);
+        }
 
         _settleOwed(tokenCurrency, callerDelta, tokenIsCurrency0);
 
@@ -534,6 +591,11 @@ contract XBlitzrLauncher is IUnlockCallback {
         IXBlitzrHook(hook).registerPosition(d.token, key, d.feeWallet);
 
         if (d.extraEth > 0) {
+            // Creator's own instant buy isn't a sniper — exempt just this purchase from the
+            // split (BlitzrTokenGuarded.guardBypassOnce); the anti-bot cap still applies.
+            if (d.guarded) {
+                IBlitzrGuardedToken(d.token).setGuardBypassOnce(d.creator);
+            }
             _instantBuy(key, tokenIsCurrency0, d.quoteCurrency, d);
         }
 
@@ -545,15 +607,9 @@ contract XBlitzrLauncher is IUnlockCallback {
     }
 
     // Zero-delta poke: realizes accrued LP fees without touching principal. XBlitzrHook only
-    // allows this specific call shape (liquidityDelta == 0, sender == this contract) through
-    // beforeRemoveLiquidity — any other caller or any nonzero delta reverts there.
-    //
-    // currency0/currency1 just reflects address sort order, which varies per launch, so which
-    // leg is "the token" vs "the quote" has to be resolved against the actual token address,
-    // not assumed from position. Both legs are split creatorBps/platformBps between the
-    // creator's feeWallet and platformWallet — platform's share absorbs rounding dust (computed
-    // as the remainder after creator's share, not its own bps multiply, to avoid a second
-    // independent rounding loss).
+    // allows this exact shape (liquidityDelta == 0, sender == this contract) through
+    // beforeRemoveLiquidity. currency0/currency1 sort order varies per launch, so which leg is
+    // "the token" has to be resolved against the actual token address.
     function _executePoke(address token) private returns (uint256 quotePaid, uint256 tokenAmount) {
         PoolFeePosition storage pos = poolFeePositions[token];
 
@@ -570,6 +626,7 @@ contract XBlitzrLauncher is IUnlockCallback {
 
         (address feeWallet,,) = IXBlitzrHook(hook).positions(token);
         address platform = IXBlitzrHook(hook).platformWallet();
+        uint256 creatorBps_ = IXBlitzrHook(hook).creatorBps();
 
         bool tokenIsCurrency0 = Currency.unwrap(pos.key.currency0) == token;
         (Currency tokenCurrency, Currency quoteCurrency) = tokenIsCurrency0
@@ -584,14 +641,14 @@ contract XBlitzrLauncher is IUnlockCallback {
 
         if (quoteAmt > 0) {
             quotePaid = uint256(uint128(quoteAmt));
-            quoteToCreator  = quotePaid * creatorBps / BPS;
+            quoteToCreator  = quotePaid * creatorBps_ / BPS;
             quoteToPlatform = quotePaid - quoteToCreator;
             if (quoteToCreator  > 0) poolManager.take(quoteCurrency, feeWallet, quoteToCreator);
             if (quoteToPlatform > 0) poolManager.take(quoteCurrency, platform,  quoteToPlatform);
         }
         if (tokenAmt > 0) {
             tokenAmount = uint256(uint128(tokenAmt));
-            tokenToCreator  = tokenAmount * creatorBps / BPS;
+            tokenToCreator  = tokenAmount * creatorBps_ / BPS;
             tokenToPlatform = tokenAmount - tokenToCreator;
             if (tokenToCreator  > 0) poolManager.take(tokenCurrency, feeWallet, tokenToCreator);
             if (tokenToPlatform > 0) poolManager.take(tokenCurrency, platform,  tokenToPlatform);
@@ -610,13 +667,10 @@ contract XBlitzrLauncher is IUnlockCallback {
     }
 
     // Single-hop when the quote currency is native; multi-hop (native → quoteToken → token)
-    // when it isn't, routing the first leg through the quote token's registered reference pool.
-    // No external router needed in V4 — the launcher calls PoolManager itself within the same
-    // unlock() context, and for the multi-hop case the intermediate quoteToken leg nets to zero
-    // in PoolManager's internal per-currency ledger without ever being physically transferred
-    // (hop 1 credits exactly what hop 2 debits, in the same currency, same unlock() call).
-    // minTokensOut is checked once, against the final output only — a bad rate on either hop
-    // shows up as a smaller final amount, so one check at the end covers the whole route.
+    // otherwise. No external router needed — the intermediate quoteToken leg nets to zero in
+    // PoolManager's internal ledger without ever being physically transferred (hop 1 credits
+    // exactly what hop 2 debits, same currency, same unlock() call). minTokensOut is checked
+    // once against the final output, covering both hops.
     function _instantBuy(
         PoolKey memory key,
         bool tokenIsCurrency0,
@@ -651,9 +705,8 @@ contract XBlitzrLauncher is IUnlockCallback {
         }
     }
 
-    // First hop of a multi-hop instant buy: native ETH → quoteToken, via the quote token's
-    // registered reference pool. Native is always currency0 there (address(0) sorts below any
-    // nonzero address), so the direction is fixed, unlike the token/quote ordering elsewhere.
+    // First hop of a multi-hop instant buy. Native is always currency0 (address(0) sorts below
+    // any nonzero address), so the direction is fixed here, unlike elsewhere in this contract.
     function _swapNativeToQuote(
         Currency quoteCurrency,
         uint24  refFee,
@@ -695,8 +748,17 @@ contract XBlitzrLauncher is IUnlockCallback {
         IBlitzrToken(token).initBlitzr(name_, symbol_, metaURI_, address(this), antiBotBlocks);
     }
 
-    // sqrtPriceX96 targeting marketCapRef for TOTAL_SUPPLY, adjusted for token ordering —
-    // identical math to V3's BlitzrLauncher, the price formula is DEX-version-agnostic.
+    function _deployAndInitGuarded(
+        string calldata name_,
+        string calldata symbol_,
+        string calldata metaURI_
+    ) private returns (address token) {
+        bytes32 salt = keccak256(abi.encodePacked(msg.sender, block.timestamp, name_, symbol_, metaURI_, "guarded"));
+        token = _clone(guardedTokenImpl, salt);
+        IBlitzrToken(token).initBlitzr(name_, symbol_, metaURI_, address(this), antiBotBlocks);
+    }
+
+    // sqrtPriceX96 targeting marketCapRef for TOTAL_SUPPLY — identical math to V3's BlitzrLauncher.
     function _computeSqrtPriceX96(bool tokenIsCurrency0, uint256 marketCapRef_) private pure returns (uint160) {
         return tokenIsCurrency0
             ? _sqrtPriceX96(TOTAL_SUPPLY, marketCapRef_)

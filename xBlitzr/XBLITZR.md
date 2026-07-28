@@ -3,10 +3,20 @@
 xBlitzr is the Uniswap V4 counterpart to the V3 Blitzr stack (`../contracts/`). Same job —
 launch a token, seed permanent one-sided liquidity, lock it forever — rebuilt on V4's singleton
 `PoolManager` + hooks architecture instead of per-pool V3 contracts. xBlitzr runs **two
-independent revenue streams**: a 1 % pool LP fee split `creatorBps`/`platformBps` (default
-85 % / 15 %, owner-adjustable, applied to both currency legs) and a separate `hookFeeBps` hook
-fee (default 0.3 %, owner-adjustable) paid entirely to the platform. No charity wallet in this
-variant.
+independent revenue streams, both split the same `creatorBps`/`platformBps` ratio** (default
+80 % / 20 %, owner-adjustable — see "Fee Split Source of Truth" below): the 1 % pool LP fee
+(applied to both currency legs) and a separate `hookFeeBps` hook fee (default 0.35 %,
+owner-adjustable) skimmed live on every swap. No charity wallet in this variant.
+
+### Fee Split Source of Truth
+
+`creatorBps`/`platformBps` live on `XBlitzrHook`, not `XBlitzrLauncher` — the hook is the single
+source of truth for both revenue streams, set once via `XBlitzrHook.setFeeBps(creator, platform)`.
+`XBlitzrLauncher.collectPoolFees` reads the current values live via `IXBlitzrHook.creatorBps()`/
+`platformBps()` rather than storing its own copy, so the pool fee and hook fee can never drift
+apart into two different ratios. This mirrors how `platformWallet` already worked (always read
+from the hook, never duplicated on the launcher) — `creatorBps`/`platformBps` just extend the
+same pattern.
 
 ---
 
@@ -46,15 +56,16 @@ share one gate. That gate distinguishes them by delta value, not by who's asking
   check.
 
 **The hook's own cut is separate and immediate** — `XBlitzrHook.afterSwap` skims `hookFeeBps`
-(default 0.3 %) off every swap's unspecified-currency leg live, via the returned-delta mechanism,
-and pays it entirely to `platformWallet` via a direct `poolManager.take()` call. No claim step, no
-pending balance — this one lands the instant a swap happens, same swap that also generates the
-pool-fee accrual the creator/platform later collect via `collectPoolFees`.
+(default 0.35 %) off every swap's unspecified-currency leg live, via the returned-delta mechanism,
+splits it `creatorBps`/`platformBps` between the token's `feeWallet` and `platformWallet`, and
+pays both out via direct `poolManager.take()` calls. No claim step, no pending balance — this
+lands the instant a swap happens, same swap that also generates the pool-fee accrual the
+creator/platform later collect via `collectPoolFees`.
 
 So a single swap generates revenue for *both* streams simultaneously: the pool's native 1 % LP
 fee accrues silently until someone pokes it (creator/platform split, claimed), and the hook's
-separate 0.3 % skim pays out immediately (platform-only, live) — two different mechanisms,
-running side by side on every trade.
+separate 0.35 % skim pays out immediately (also creator/platform split, live) — two different
+mechanisms, same ratio, running side by side on every trade.
 
 ---
 
@@ -83,13 +94,14 @@ XBlitzrLauncher
         └─ poolManager.unlock(...)  →  unlockCallback:
               ├─ poolManager.modifyLiquidity(key, {liquidityDelta: 0, ...})   ← the poke
               └─ take() whatever comes back, split creatorBps/platformBps between feeWallet
-                 and platformWallet (default 85/15)
+                 and platformWallet (default 80/20)
 
 XBlitzrHook  (attached to every xBlitzr pool)
   ├─ beforeAddLiquidity    → only the launcher may ever call this, and only once
   ├─ beforeRemoveLiquidity → liquidityDelta == 0 allowed, but launcher-only (the poke above);
   │                          liquidityDelta != 0 always reverts, from anyone, forever
-  └─ afterSwap → skims hookFeeBps of every swap, live, entirely to platformWallet (default 0.3 %)
+  └─ afterSwap → skims hookFeeBps of every swap, live, split creatorBps/platformBps between
+                 feeWallet and platformWallet (default 80/20, hookFeeBps default 0.35 %)
 ```
 
 ---
@@ -174,11 +186,14 @@ from without violating the swapper's requested exact amount:
 
 `unspecifiedIsCurrency0 = !(zeroForOne == (amountSpecified < 0))`.
 
-The cut is computed as `hookFeeBps` (default 30 bps = 0.3 %, owner-adjustable via
-`setHookFeeBps`) of the unspecified leg's realized delta magnitude, taken via a single direct
-`poolManager.take(feeCurrency, platformWallet, cut)` call, and the cut is returned from
-`afterSwap` as the hook's delta so `PoolManager`'s internal accounting for the swap stays
-balanced. This sign convention and the settlement ordering (the `take()` call creates a debt on
+The cut is computed as `hookFeeBps` (default 35 bps = 0.35 %, owner-adjustable via
+`setHookFeeBps`) of the unspecified leg's realized delta magnitude, split `creatorBps`/
+`platformBps` (default 80/20, same ratio as the pool LP fee — see "Fee Split Source of Truth"
+above) via up to two direct `poolManager.take(feeCurrency, ..., ...)` calls — one to the token's
+`feeWallet`, one to `platformWallet`, each skipped if its share rounds to zero. The full,
+unsplit cut is returned from `afterSwap` as the hook's delta so `PoolManager`'s internal
+accounting for the swap stays balanced regardless of how many recipients it was split across.
+This sign convention and the settlement ordering (the `take()` calls create a debt on
 the hook's own currency ledger; `PoolManager` credits that ledger with the returned delta
 immediately after `afterSwap` returns, netting it to zero before `unlock()` finishes — see
 `_accountPoolBalanceDelta` in `PoolManager.swap()`) have been traced against
@@ -209,10 +224,10 @@ sells accrue fees in the token currency.
 `_executePoke` resolves which of `currency0`/`currency1` is actually the launched token
 (comparing against the `token` address directly — address sort order varies per launch, so this
 can't be assumed from position), then splits **both** legs the same way:
-- The creator's share (`creatorBps`, default 8 500 = 85 %) is paid to the creator's registered
+- The creator's share (`creatorBps`, default 8 000 = 80 %) is paid to the creator's registered
   `feeWallet` (looked up live via `IXBlitzrHook.positions(token)`, so a CTO reassignment via
   `ctoFeeWallet` immediately redirects future collections too).
-- The platform's share (`platformBps`, default 1 500 = 15 %) is paid to `platformWallet` (looked
+- The platform's share (`platformBps`, default 2 000 = 20 %) is paid to `platformWallet` (looked
   up live via `IXBlitzrHook.platformWallet()`), computed as the remainder after the creator's
   share rather than its own bps multiply, so rounding dust always lands with the platform instead
   of being lost twice.
