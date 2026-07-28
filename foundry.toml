@@ -9,16 +9,14 @@ optimizer = true
 optimizer_runs = 200
 via_ir = true
 # src = "." makes forge treat every .sol file under the repo root as an independent compile
-# target, which would otherwise sweep in lib/v4-core's own dev-only dependencies
-# (openzeppelin-contracts, solmate) and not buildable under this project's pinned solc_version.
-# lib/openzeppelin-contracts-upgradeable/{test,lib/{erc4626-tests,forge-std,halmos-cheatcodes}}
-# and the same two subpaths one level down (its own nested openzeppelin-contracts dependency):
-# BlitzrSwapRouter imports real source from both openzeppelin-contracts-upgradeable/contracts/
-# and its nested lib/openzeppelin-contracts/contracts/ (several upgradeable contracts still pull
-# stateless utils from the base package) — those must stay reachable. Only each package's own
-# dev-only test suite and test-only dependencies are excluded, same reasoning as lib/v4-core above.
+# target — lib/openzeppelin-contracts-upgradeable/{test,lib/{erc4626-tests,forge-std,
+# halmos-cheatcodes}} and the same two subpaths one level down (its own nested
+# openzeppelin-contracts dependency) must be excluded, since BlitzrSwapRouter imports real source
+# from both openzeppelin-contracts-upgradeable/contracts/ and its nested
+# lib/openzeppelin-contracts/contracts/ (several upgradeable contracts still pull stateless utils
+# from the base package) — those must stay reachable. Only each package's own dev-only test suite
+# and test-only dependencies are excluded here.
 skip = [
-    "lib/v4-core/**",
     "lib/openzeppelin-contracts-upgradeable/test/**",
     "lib/openzeppelin-contracts-upgradeable/fv/**",
     "lib/openzeppelin-contracts-upgradeable/lib/erc4626-tests/**",
