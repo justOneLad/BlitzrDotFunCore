@@ -5,8 +5,9 @@ launch a token, seed permanent one-sided liquidity, lock it forever — rebuilt 
 `PoolManager` + hooks architecture instead of per-pool V3 contracts. xBlitzr runs **two
 independent revenue streams, both split the same `creatorBps`/`platformBps` ratio** (default
 80 % / 20 %, owner-adjustable — see "Fee Split Source of Truth" below): the 1 % pool LP fee
-(applied to both currency legs) and a separate `hookFeeBps` hook fee (default 0.35 %,
-owner-adjustable) skimmed live on every swap. No charity wallet in this variant.
+(applied to both currency legs) and a separate `hookFeeBps` hook fee (default 1 %,
+owner-adjustable) skimmed live on every swap — 2 % total by default. No charity wallet in this
+variant.
 
 ### Fee Split Source of Truth
 
@@ -57,7 +58,7 @@ share one gate. That gate distinguishes them by delta value, not by who's asking
   check.
 
 **The hook's own cut is separate and immediate** — `XBlitzrHook.afterSwap` skims `hookFeeBps`
-(default 0.35 %) off every swap's unspecified-currency leg live, via the returned-delta mechanism,
+(default 1 %) off every swap's unspecified-currency leg live, via the returned-delta mechanism,
 splits it `creatorBps`/`platformBps` between the token's `feeWallet` and `platformWallet`, and
 pays both out via direct `poolManager.take()` calls. No claim step, no pending balance — this
 lands the instant a swap happens, same swap that also generates the pool-fee accrual the
@@ -65,8 +66,8 @@ creator/platform later collect via `collectPoolFees`.
 
 So a single swap generates revenue for *both* streams simultaneously: the pool's native 1 % LP
 fee accrues silently until someone pokes it (creator/platform split, claimed), and the hook's
-separate 0.35 % skim pays out immediately (also creator/platform split, live) — two different
-mechanisms, same ratio, running side by side on every trade.
+separate 1 % skim pays out immediately (also creator/platform split, live) — two different
+mechanisms, same ratio, running side by side on every trade, 2 % combined by default.
 
 ---
 
@@ -102,7 +103,7 @@ XBlitzrHook  (attached to every xBlitzr pool)
   ├─ beforeRemoveLiquidity → liquidityDelta == 0 allowed, but launcher-only (the poke above);
   │                          liquidityDelta != 0 always reverts, from anyone, forever
   └─ afterSwap → skims hookFeeBps of every swap, live, split creatorBps/platformBps between
-                 feeWallet and platformWallet (default 80/20, hookFeeBps default 0.35 %)
+                 feeWallet and platformWallet (default 80/20, hookFeeBps default 1 %)
 ```
 
 ---
@@ -187,7 +188,7 @@ from without violating the swapper's requested exact amount:
 
 `unspecifiedIsCurrency0 = !(zeroForOne == (amountSpecified < 0))`.
 
-The cut is computed as `hookFeeBps` (default 35 bps = 0.35 %, owner-adjustable via
+The cut is computed as `hookFeeBps` (default 100 bps = 1 %, owner-adjustable via
 `setHookFeeBps`) of the unspecified leg's realized delta magnitude, split `creatorBps`/
 `platformBps` (default 80/20, same ratio as the pool LP fee — see "Fee Split Source of Truth"
 above) via up to two direct `poolManager.take(feeCurrency, ..., ...)` calls — one to the token's

@@ -79,7 +79,7 @@ contract XBlitzrHook {
 
     // Cut taken out of every swap's unspecified-currency leg — separate from and in addition to
     // the pool's own 1% LP fee (set in PoolKey.fee by the launcher).
-    uint256 public hookFeeBps = 35; // 0.35 %, owner-adjustable via setHookFeeBps
+    uint256 public hookFeeBps = 100; // 1 %, owner-adjustable via setHookFeeBps
     uint256 private constant BPS = 10_000;
 
     // Single source of truth for the creator/platform split, also read by
