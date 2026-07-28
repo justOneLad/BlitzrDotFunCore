@@ -10,6 +10,11 @@ Smart contracts for [blitzr.fun](https://blitzr.fun). Two parallel launch stacks
 Blitzr and xBlitzr clone the same shared `BlitzrToken.sol` implementation (or, for guarded
 launches, `contracts/BlitzrTokenGuarded.sol`).
 
+Alongside the two launch stacks, [`BlitzrSwapRouter/`](BlitzrSwapRouter/) is a standalone,
+UUPS-upgradeable DEX-aggregator router (Uniswap V2/V3/V4 + any allowlisted DEX) with Permit2,
+split routing, and multi-token referral/cashback rewards — see
+[`BlitzrSwapRouter/BlitzrSwapRouter.md`](BlitzrSwapRouter/BlitzrSwapRouter.md).
+
 ## Layout
 
 ```

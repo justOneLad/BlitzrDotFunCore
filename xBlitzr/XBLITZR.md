@@ -29,7 +29,8 @@ same pattern.
 
 The token is **not** duplicated here — xBlitzr clones the same `contracts/BlitzrToken.sol`
 implementation the V3 stack uses (`tokenImpl` in the constructor points at that deployed
-contract). It's a plain EIP-1167 clone template with no V3/V4-specific logic, so there's nothing
+contract), or `contracts/BlitzrTokenGuarded.sol` for guarded launches (see *Guarded Launch
+Mode*). Both are plain EIP-1167 clone templates with no V3/V4-specific logic, so there's nothing
 to fork.
 
 ---
@@ -286,3 +287,32 @@ transfer, not after, or the transfer itself would trip the cap).
 `antiBotBlocks` (default 10) is owner-adjustable via `XBlitzrLauncher.setAntiBotBlocks`, passed
 to `initBlitzr` on every launch. As with V3, there's no creator carve-out — an instant buy larger
 than 2.5% of supply reverts the whole `launch()` call during the window.
+
+---
+
+## Guarded Launch Mode
+
+`launchGuarded(name, symbol, metaURI, feeWallet, quoteToken, minTokensOut, windowBlocks)` is the
+V4 counterpart to V3's `launchGuarded` — same `BlitzrTokenGuarded` mechanics (decaying
+liquid/vested/burn split on purchases during a protection window; see `BLITZR.md` → *Guarded
+Launch Mode* for the full split math and constants, identical on both stacks).
+
+The only V4-specific difference is **what counts as "the pool"** for split detection: V4 has no
+per-launch pool contract, so `initGuard` is called with `address(poolManager)` — the singleton
+itself — as the `pool` address. `BlitzrTokenGuarded._transfer` treats any transfer *from*
+`poolManager` as a guarded purchase, exactly as V3 treats a transfer from the per-launch pool
+address.
+
+`initGuard(address(poolManager), windowBlocks, guardMaxVestBlocks)` is called inside
+`_executeLaunch`, before `_settleOwed` — the same "must happen before principal ever moves"
+ordering as the anti-bot exemption above, so the split is live from the very first block any real
+swap could occur in. Settling principal into `PoolManager` is the launcher paying the pool, not
+the pool paying anyone out, so it never triggers the split itself regardless of ordering — but
+the guard is armed before that transfer anyway, for the same defense-in-depth reason the
+exemption is.
+
+The creator's own instant buy gets the same one-shot bypass as V3
+(`BlitzrTokenGuarded.setGuardBypassOnce(creator)`, armed immediately before `_instantBuy` runs)
+and the same protocol-level `guardMaxVestBlocks` ceiling
+(`XBlitzrLauncher.setGuardMaxVestBlocks`, default 216 000 blocks, owner-only) — configuration and
+enablement (`setGuardedTokenImpl`) work identically to the V3 launcher.

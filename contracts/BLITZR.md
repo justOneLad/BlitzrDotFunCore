@@ -9,8 +9,10 @@ Blitzr lets anyone deploy a meme token and seed permanent one-sided V3 liquidity
 | File | Contract | Role |
 |------|----------|------|
 | `BlitzrToken.sol` | `BlitzrToken` | ERC-20 + EIP-2612 implementation used as the EIP-1167 clone template |
+| `BlitzrTokenGuarded.sol` | `BlitzrTokenGuarded` | Guarded-launch variant of `BlitzrToken` — see *Guarded Launch Mode* |
 | `BlitzrLauncher.sol` | `BlitzrLauncher` | Orchestrates every launch — clones token, creates pool, seeds one-sided liquidity |
 | `BlitzrLocker.sol` | `BlitzrLocker` | Permanent LP-NFT vault; distributes swap fees to creator and platform, with an optional per-token burn |
+| `BlitzrTreasury.sol` | `BlitzrTreasury` | Standalone, timelocked vault for platform revenue — see *Platform Treasury* |
 
 ---
 
@@ -244,6 +246,116 @@ ownership at the end of `launch()` — the exemption list is effectively frozen 
 
 ---
 
+## Guarded Launch Mode
+
+`launchGuarded(...)` is an opt-in alternative to `launch()` for creators who want stronger
+protection against snipers and bundlers than the flat anti-bot cap alone provides. It clones
+`BlitzrTokenGuarded` instead of `BlitzrToken` — the same ERC-20/permit/anti-bot core, plus a
+**decaying liquid/vested/burn split** applied to every purchase from the pool during a
+protection window.
+
+```
+launchGuarded(name, symbol, metaURI, feeWallet, factory, quoteToken, windowBlocks)  payable
+```
+
+Everything about the launch flow (fee collection, pool creation, one-sided liquidity, instant
+buy) is identical to `launch()` — see *Launch Flow* — with one addition: `initGuard(pool,
+windowBlocks, guardMaxVestBlocks)` is called on the token immediately after the pool is
+exempted and before liquidity is minted, so the split is live from the very first block any
+real swap could occur in.
+
+### The split
+
+A purchase landing at the very **start** of the window is hit hardest; the split decays
+linearly to a plain 50/50 liquid/vested split (no burn) by the **end** of the window. After the
+window closes, purchases are entirely normal, exactly like `BlitzrToken`.
+
+```
+progress = remaining_blocks / windowBlocks        (1e18 at window start, ~0 at window end)
+
+burnBps      = MAX_BURN_BPS × progress             (30% at start, decaying to 0%)
+vestedAmount = amount × VEST_BPS                    (fixed 50%, does not decay)
+burnedAmount = amount × burnBps
+liquidAmount = amount − vestedAmount − burnedAmount
+
+releaseBlock = block.number + maxVestBlocks × progress
+```
+
+`VEST_BPS` (50%) and `MAX_BURN_BPS` (30% at window start) are **fixed constants**, not owner- or
+creator-tunable — only `windowBlocks` (the protection window length) and the vesting lock
+ceiling are configurable, and at two different levels:
+
+| Parameter | Set by | Scope |
+|-----------|--------|-------|
+| `windowBlocks` | Creator, per launch (`launchGuarded` argument) | How long the protection window lasts for this one token |
+| `guardMaxVestBlocks` | Platform owner (`BlitzrLauncher.setGuardMaxVestBlocks`) | The vesting lock ceiling for *every* guarded launch — a purchase at the very start of the window vests for this long; `0` is valid and disables the vesting lock entirely while keeping the liquid/burn split active |
+
+`guardMaxVestBlocks` defaults to **216 000** (~30 days at 12s/block).
+
+### Creator's own instant buy
+
+The creator's own instant buy (if `extraEth` is sent) isn't a sniper and shouldn't be punished
+for landing in block 1 the same way a bot would be. `BlitzrLauncher` arms a one-shot bypass —
+`BlitzrTokenGuarded.setGuardBypassOnce(creator)` — immediately before executing the instant buy;
+it exempts exactly that one incoming transfer from the split and then self-consumes, regardless
+of whether that transfer turns out to be a guarded buy at all. The anti-bot max-wallet cap still
+applies to the creator's instant buy unchanged — this bypass only affects the liquid/vested/burn
+split, nothing else.
+
+### Claiming vested tokens
+
+The vested leg of a purchase is held by the token contract itself until it matures, then
+released permissionlessly:
+
+```solidity
+function claimVested() external returns (uint256 claimed);            // caller's own schedule
+function claimVestedFor(address account) external returns (uint256);  // claim on behalf of anyone
+function vestedBalanceOf(address account) external view returns (uint256);
+function claimableVested(address account) external view returns (uint256);
+```
+
+`claimVestedFor` is permissionless by design — payout always lands with the rightful owner
+regardless of who triggers it, useful for automation/keepers.
+
+### Enabling guarded mode
+
+Disabled by default — `guardedTokenImpl` is `address(0)` until the owner deploys a
+`BlitzrTokenGuarded` implementation and registers it:
+
+```solidity
+function setGuardedTokenImpl(address impl) external onlyOwner;
+function setGuardMaxVestBlocks(uint256 blocks) external onlyOwner;
+```
+
+`launchGuarded()` reverts with `GuardedModeNotConfigured` until `guardedTokenImpl` is set.
+
+---
+
+## Platform Treasury
+
+`BlitzrTreasury` is a standalone, timelocked vault for platform revenue — not part of the launch
+flow itself, but the intended destination for `launchFeeWallet`, `BlitzrLocker`'s
+`platformWallet`, and any other platform-side fee recipient in this repo. It has no awareness of
+the contracts that pay into it; anything can send it native value or hold ERC-20 balances for it
+to sweep out.
+
+Every outflow goes through a timelock: `queueWithdrawal` → wait `timelockDelay` → `executeWithdrawal`
+(or `cancelWithdrawal` at any point before execution). `timelockDelay` is fixed at deploy time and
+never owner-adjustable — an adjustable delay would let a compromised owner key simply set it to
+`0` and drain immediately, defeating the whole point.
+
+```solidity
+function queueWithdrawal(address token, address to, uint256 amount) external onlyOwner returns (bytes32 id);
+function cancelWithdrawal(address token, address to, uint256 amount) external onlyOwner;
+function executeWithdrawal(address token, address to, uint256 amount) external onlyOwner;
+```
+
+`token == address(0)` withdraws native value; any other address withdraws that ERC-20. Deposits
+need no special handling — `receive()` accepts plain native transfers, and ERC-20 balances just
+sit in the contract until queued out.
+
+---
+
 ## Constructor Arguments
 
 ### BlitzrLocker
@@ -269,6 +381,18 @@ constructor(
 )
 ```
 
+`guardedTokenImpl` is not a constructor argument — it starts disabled (`address(0)`) and is set
+later via `setGuardedTokenImpl` once a `BlitzrTokenGuarded` implementation is deployed.
+
+### BlitzrTreasury
+
+```solidity
+constructor(
+    address owner_,          // Admin — can queue/cancel/execute withdrawals, transfer ownership
+    uint256 timelockDelay_   // Fixed forever; must be > 0
+)
+```
+
 ---
 
 ## Deployment Order
@@ -279,6 +403,11 @@ constructor(
 4. Call `BlitzrLocker.setLauncher(blitzrLauncher, true)`
 5. Call `BlitzrLauncher.addDex(...)` for each additional DEX
 6. Call `BlitzrLauncher.addQuoteToken(...)` for USDC, WBTC, or other supported assets
+7. *(optional)* Deploy `BlitzrTreasury(owner, timelockDelay)` and point `launchFeeWallet` /
+   `BlitzrLocker.platformWallet` at it
+8. *(optional, for guarded launches)* Deploy `BlitzrTokenGuarded` implementation, call
+   `BlitzrLauncher.setGuardedTokenImpl(impl)` — `setGuardMaxVestBlocks` only if the 216 000-block
+   default isn't right for this chain
 
 ---
 
@@ -296,6 +425,8 @@ constructor(
 | `setMarketCapRef(token, ref)` | Update the price-init reference for an existing quote token |
 | `setLaunchFeeWallet(wallet)` | Update the platform launch-fee recipient |
 | `setAntiBotBlocks(blocks)` | Update how many blocks after launch the anti-bot max-wallet cap applies for |
+| `setGuardedTokenImpl(impl)` | Register (or disable, with `address(0)`) the `BlitzrTokenGuarded` implementation `launchGuarded` clones |
+| `setGuardMaxVestBlocks(blocks)` | Update the protocol-level vesting lock ceiling for guarded launches; `0` is valid |
 | `rescueETH(to, amount)` | Recover ETH stuck in this contract (e.g. from a failed launch mid-flight) |
 | `rescueERC20(token, to, amount)` | Recover ERC-20 tokens stuck in this contract |
 | `transferOwnership(newOwner)` | Transfer launcher admin |
@@ -305,6 +436,7 @@ constructor(
 | Function | Description |
 |----------|-------------|
 | `launch(name, symbol, metaURI, feeWallet, factory, quoteToken) payable` | Deploy token, seed one-sided pool, lock LP — returns `(token, pool, tokenId)`. `msg.value` must be `>= launchFee`; any excess funds an instant buy |
+| `launchGuarded(name, symbol, metaURI, feeWallet, factory, quoteToken, windowBlocks) payable` | Same as `launch`, but clones `BlitzrTokenGuarded` and arms the decaying liquid/vested/burn split for `windowBlocks` — see *Guarded Launch Mode*. Reverts with `GuardedModeNotConfigured` until the owner sets `guardedTokenImpl` |
 
 ### BlitzrLocker (owner)
 
@@ -347,6 +479,28 @@ Standard ERC-20 (`transfer`, `transferFrom`, `approve`, `allowance`, `balanceOf`
 | `isExempt(account)` | Whether `account` is exempt from the anti-bot cap |
 | `setExempt(account, exempt)` | Owner-only (window before the launcher renounces); grant/revoke an exemption |
 
+### BlitzrTokenGuarded (public)
+
+Same ERC-20/permit/anti-bot surface as `BlitzrToken` above, plus:
+
+| Function | Description |
+|----------|-------------|
+| `claimVested()` | Release the caller's own matured vesting entries |
+| `claimVestedFor(account)` | Permissionless — release `account`'s matured entries; payout still lands with `account` |
+| `vestedBalanceOf(account)` | Still-locked portion of `account`'s guarded-window purchases |
+| `claimableVested(account)` | Sum of `account`'s entries that have matured but not yet been claimed |
+| `vestScheduleLength(account)` / `vestScheduleAt(account, i)` | Enumerate an account's individual vesting entries |
+| `pool()` / `windowBlocks()` / `windowEndBlock()` / `maxVestBlocks()` | Guard configuration, set once via `initGuard` |
+
+### BlitzrTreasury (owner)
+
+| Function | Description |
+|----------|-------------|
+| `queueWithdrawal(token, to, amount)` | Start the timelock clock on a withdrawal; returns its `id` |
+| `cancelWithdrawal(token, to, amount)` | Cancel a queued withdrawal before it executes |
+| `executeWithdrawal(token, to, amount)` | Execute a queued withdrawal once `timelockDelay` has elapsed |
+| `transferOwnership(newOwner)` | Transfer treasury admin — instant, not timelocked (even a stolen key can't skip the withdrawal delay by first stealing ownership) |
+
 ---
 
 ## Key Constants (BlitzrLauncher)
@@ -363,6 +517,9 @@ Standard ERC-20 (`transfer`, `transferFrom`, `approve`, `allowance`, `balanceOf`
 | `TICK_SPACING` | 200 | Required by 1 % fee tier |
 | `antiBotBlocks` | 10 by default, owner-updatable | Blocks after launch during which `BlitzrToken`'s 2.5 % max-wallet cap applies |
 | `MAX_WALLET_BPS` (on `BlitzrToken`) | 250 (2.5 %) | Fixed constant, not adjustable |
+| `guardMaxVestBlocks` | 216 000 by default (~30 days @ 12s/block), owner-updatable | Vesting lock ceiling for guarded launches — see *Guarded Launch Mode* |
+| `VEST_BPS` (on `BlitzrTokenGuarded`) | 5 000 (50 %) | Fixed constant, not adjustable |
+| `MAX_BURN_BPS` (on `BlitzrTokenGuarded`) | 3 000 (30 % at window start) | Fixed constant, not adjustable |
 
 ---
 
